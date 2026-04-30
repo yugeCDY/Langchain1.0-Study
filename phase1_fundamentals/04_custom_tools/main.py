@@ -35,7 +35,12 @@ GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 if not GROQ_API_KEY or GROQ_API_KEY == "your_groq_api_key_here_replace_this":
     raise ValueError("请先设置 GROQ_API_KEY")
 
-model = init_chat_model("groq:llama-3.3-70b-versatile", api_key=GROQ_API_KEY)
+model = init_chat_model(
+        "openai:deepseek-v4-flash",  # Groq 提供的 Llama 3.3 模型
+        api_key=GROQ_API_KEY,
+        base_url="https://api.deepseek.com",
+    )
+# model = init_chat_model("groq:llama-3.3-70b-versatile", api_key=GROQ_API_KEY)
 
 
 # ============================================================================

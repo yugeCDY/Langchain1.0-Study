@@ -43,10 +43,10 @@ if not GROQ_API_KEY:
     )
 
 # 验证 API 密钥格式（Groq API key 通常以 gsk_ 开头）
-if not GROQ_API_KEY.startswith("gsk_"):
-    print("\n" + "⚠️  警告：你的 GROQ_API_KEY 格式可能不正确")
-    print("   Groq API 密钥通常以 'gsk_' 开头")
-    print("   请确认你从 https://console.groq.com/keys 获取了正确的密钥\n")
+# if not GROQ_API_KEY.startswith("gsk_"):
+#     print("\n" + "⚠️  警告：你的 GROQ_API_KEY 格式可能不正确")
+#     print("   Groq API 密钥通常以 'gsk_' 开头")
+#     print("   请确认你从 https://console.groq.com/keys 获取了正确的密钥\n")
 
 
 # ============================================================================
@@ -67,8 +67,9 @@ def example_1_simple_invoke():
     # 初始化模型
     # 格式：init_chat_model("提供商:模型名称")
     model = init_chat_model(
-        "groq:llama-3.3-70b-versatile",  # Groq 提供的 Llama 3.3 模型
-        api_key=GROQ_API_KEY
+        "openai:deepseek-v4-flash",  # Groq 提供的 Llama 3.3 模型
+        api_key=GROQ_API_KEY,
+        base_url="https://api.deepseek.com",
     )
 
     # 使用字符串直接调用模型
@@ -356,12 +357,12 @@ def main():
     try:
         # 运行所有示例
         example_1_simple_invoke()
-        example_2_messages()
-        example_3_dict_messages()
-        example_4_model_parameters()
-        example_5_response_structure()
-        example_6_error_handling()
-        example_7_multiple_models()
+        # example_2_messages()
+        # example_3_dict_messages()
+        # example_4_model_parameters()
+        # example_5_response_structure()
+        # example_6_error_handling()
+        # example_7_multiple_models()
 
         print("\n" + "="*70)
         print(" 所有示例运行完成！")
