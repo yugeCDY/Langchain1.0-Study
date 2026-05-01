@@ -67,7 +67,7 @@ python phase1_fundamentals/01_hello_langchain/main.py
 
 ## 📖 学习路径
 
-本仓库采用**四阶段渐进式学习**，共 24 个模块 + 3 个综合项目：
+本仓库采用**四阶段渐进式学习**，共 21 个模块 + 3 个综合项目：
 
 ### 阶段一：基础知识（第1-2周）
 📂 `phase1_fundamentals/`
@@ -81,8 +81,8 @@ python phase1_fundamentals/01_hello_langchain/main.py
 | 05 | Simple Agent | 使用 `create_agent` 创建 Agent |
 | 06 | Agent Loop | 理解 ReAct 模式执行循环 |
 
-### 阶段二：中级特性（第3-4周）
-📂 `phase2_intermediate/`
+### 阶段二：实战进阶（第3-4周）
+📂 `phase2_practical/`
 
 | 模块 | 主题 | 学习内容 |
 |------|------|----------|
@@ -90,51 +90,57 @@ python phase1_fundamentals/01_hello_langchain/main.py
 | 08 | Context Management | 消息修剪和摘要 |
 | 09 | Checkpointing | 使用 SQLite/Postgres 持久化状态 |
 | 10 | Middleware Basics | before_model 和 after_model 钩子 |
-| 11 | Middleware Monitoring | 可观测性中间件 |
-| 12 | Middleware Guardrails | PII 脱敏和输入验证 |
-| 13 | Structured Output | 使用 Pydantic 定义输出模式 |
-| 14 | Validation Retry | 优雅地处理验证失败 |
-| 15 | Multi-Tool Structured | 结合工具和结构化输出 |
+| 11 | Structured Output | 使用 Pydantic 定义输出模式 |
+| 12 | Validation Retry | 优雅地处理验证失败 |
+| 13 | RAG Basics | 文档加载、向量存储、检索增强生成 |
+| 14 | RAG Advanced | 混合检索、重排序、高级 RAG 策略 |
 
-### 阶段三：高级主题（第5-6周）
+### 阶段三：LangGraph 进阶（第5-6周）
 📂 `phase3_advanced/`
 
 | 模块 | 主题 | 学习内容 |
 |------|------|----------|
-| 16 | LangGraph Basics | 创建带节点和边的状态图 |
-| 17 | Multi-Agent | 协调多个专业化 Agent |
-| 18 | Conditional Routing | 实现动态工作流路由 |
-| 19 | Image Input | 使用视觉模型处理图像 |
-| 20 | File Handling | 处理文档上传和分析 |
-| 21 | Mixed Modality | 结合文本、图像和结构化数据 |
-| 22 | LangSmith Integration | 设置追踪和监控 |
-| 23 | Error Handling | 实现健壮的错误恢复 |
-| 24 | Cost Optimization | 追踪 token 使用并优化 |
+| 15 | LangGraph Low Level | StateGraph、节点、边、reducer、条件路由 |
+| 16 | Multi-Agent | create_react_agent、Supervisor、Handoff |
+| 17 | Human-in-the-Loop | 打断、审批、编辑（LangGraph 独有） |
+| 18 | Subgraphs | 子图嵌套、父图调用子图、图组合 |
+| 19 | Streaming & Events | 底层 stream()、节点级流式、事件过滤 |
+| 20 | Production Ready | Checkpoint 进阶、LangSmith、错误处理、成本 |
+| 21 | Multimodal & Files | 图像理解、PDF 解析、多模态消息 |
 
-### 阶段四：实际应用（第7-8周）
+### 阶段四：综合项目（第7-8周）
 📂 `phase4_projects/`
 
 | 项目 | 描述 | 核心技术 |
 |------|------|----------|
-| RAG 文档问答系统 | 基于向量数据库的文档问答 | 文档加载、向量存储、检索增强生成 |
-| 多 Agent 客户支持 | 智能客服系统 | 多 Agent 协作、HITL、对话内存 |
-| 研究助手 | 带工具的研究助手 | 网页搜索、MCP 集成、引用格式化 |
+| 研究助手 | 搜索→阅读→总结→引用 | 多 Agent、RAG、Streaming、子图 |
+| 客户支持系统 | 智能客服与工单流转 | Handoff、HITL、Memory、Checkpoint |
+| 文档问答系统 | 基于向量库的文档问答 | RAG、LangGraph、子图、可观测性 |
 
 ## 📁 项目结构
 
 ```
-langchain_v1_study/
-├── phase1_fundamentals/     # 阶段一：基础知识
-├── phase2_intermediate/     # 阶段二：中级特性
-├── phase3_advanced/         # 阶段三：高级主题
-├── phase4_projects/         # 阶段四：综合项目
-├── shared/                  # 共享资源（工具、提示词、中间件）
-├── notebooks/               # Jupyter 笔记本实验
+Langchain1.0-Study/
+├── phase1_fundamentals/     # 阶段一：基础知识 ✅
+├── phase2_practical/        # 阶段二：实战进阶 ✅
+├── phase3_advanced/         # 阶段三：LangGraph 进阶（进行中）
+│   ├── 15_langgraph_low_level/      ✅
+│   ├── 16_multi_agent/              ✅
+│   ├── 17_human_in_the_loop/        🆕
+│   ├── 18_subgraphs/                🆕
+│   ├── 19_streaming_and_events/     🆕
+│   ├── 20_production_ready/         🆕
+│   └── 21_multimodal_files/         🆕
+├── phase4_projects/         # 阶段四：综合项目（待创建）
+│   ├── 01_research_assistant/
+│   ├── 02_customer_support/
+│   └── 03_document_qa/
+├── examples/                # 扩展示例项目
 ├── docs/                    # 学习笔记和文档
-└── tests/                   # 全局测试
+├── asset/                   # 静态资源
+└── requirements.txt         # Python 依赖
 ```
 
-详细结构请查看 [CLAUDE.md](./CLAUDE.md)
 
 ## 🎯 使用指南
 

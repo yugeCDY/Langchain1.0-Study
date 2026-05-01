@@ -12,6 +12,8 @@
 *.sqlite
 *.db
 CLAUDE.md
+AGENT.md
+agent.md
 # API Keys 和配置文件
 *_api_key*
 *_secret*
@@ -230,6 +232,7 @@ checkpoints/
 
 # 向量数据库存储
 chroma_db/
+chroma_store/
 faiss_index/
 *.index
 *.faiss

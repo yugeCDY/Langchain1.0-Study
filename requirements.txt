@@ -67,6 +67,7 @@ langchain-text-splitters>=0.3.0
 
 # Chroma - 轻量级向量数据库（��荐用于学习）
 chromadb>=0.5.0
+langchain-chroma>=0.1.2
 
 # FAISS - Facebook AI 相似度搜索
 faiss-cpu>=1.8.0
@@ -94,6 +95,12 @@ rank_bm25>=0.2.2
 pypdf>=5.0.0
 # 或使用 PyMuPDF（更快）
 # pymupdf>=1.24.0
+
+# PDF 生成（用于企业级 RAG 样本文档）
+fpdf2>=2.8.0
+
+# 高级 PDF 解析（可选，用于表格/图片识别）
+# unstructured[pdf]>=0.15.0
 
 # Word 文档处理
 python-docx>=1.1.0
