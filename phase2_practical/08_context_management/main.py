@@ -23,7 +23,13 @@ GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 if not GROQ_API_KEY or GROQ_API_KEY == "your_groq_api_key_here_replace_this":
     raise ValueError("请先设置 GROQ_API_KEY")
 
-model = init_chat_model("groq:llama-3.3-70b-versatile", api_key=GROQ_API_KEY)
+model = init_chat_model(
+        "openai:deepseek-v4-flash",  # Groq 提供的 Llama 3.3 模型
+        api_key=GROQ_API_KEY,
+        base_url="https://api.deepseek.com",
+        extra_body={"thinking": {"type": "disabled"}},
+    )
+# model = init_chat_model("groq:llama-3.3-70b-versatile", api_key=GROQ_API_KEY)
 
 @tool
 def calculator(operation: str, a: float, b: float) -> str:
@@ -104,7 +110,7 @@ def example_2_summarization_middleware():
         checkpointer=InMemorySaver(),
         middleware=[
             SummarizationMiddleware(
-                model="groq:llama-3.3-70b-versatile",
+                model=model,
                 trigger=("tokens", 500)  # 超过 500 tokens 就摘要
             )
         ]
@@ -363,8 +369,8 @@ def main():
     print("="*70)
 
     try:
-        example_1_problem_unlimited_growth()
-        input("\n按 Enter 继续...")
+        # example_1_problem_unlimited_growth()
+        # input("\n按 Enter 继续...")
 
         example_2_summarization_middleware()
         input("\n按 Enter 继续...")

@@ -14,7 +14,7 @@ def calculator(operation: str, a: float, b: float) -> str:
     执行基本的数学计算
 
     参数:
-        operation: 运算类型，支持 "add"(加), "subtract"(减), "multiply"(乘), "divide"(除)
+        operation: 运算类型，支持 "add"(加), "subtract"(减), "multiply"(乘以), "divide"(除)
         a: 第一个数字
         b: 第二个数字
 
