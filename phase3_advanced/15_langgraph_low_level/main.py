@@ -578,14 +578,14 @@ def main():
     print("="*70)
 
     try:
-        # example_1_dify_style_workflow()
-        # input("\n按 Enter 继续...")
+        example_1_dify_style_workflow()
+        input("\n按 Enter 继续...")
 
-        # example_2_sequential_nodes()
-        # input("\n按 Enter 继续...")
+        example_2_sequential_nodes()
+        input("\n按 Enter 继续...")
 
-        # example_3_conditional_routing()
-        # input("\n按 Enter 继续...")
+        example_3_conditional_routing()
+        input("\n按 Enter 继续...")
 
         example_4_state_reducer()
         input("\n按 Enter 继续...")
