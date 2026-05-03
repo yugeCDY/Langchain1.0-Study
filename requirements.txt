@@ -47,9 +47,17 @@ langchain-google-genai>=2.0.0
 langchain-huggingface>=0.1.0
 
 # HuggingFace Transformers 和 Embeddings
-sentence-transformers>=3.0.0
-transformers>=4.40.0
-torch>=2.0.0  # PyTorch（用于 HuggingFace 模型）
+# Python 3.13 下暂不安装，避免与 torch wheel 兼容性冲突
+sentence-transformers==2.7.0; python_version < "3.13"
+transformers>=4.40.0,<5.0.0; python_version < "3.13"
+# Intel Mac(x86_64) + torch 2.2.2 需要 numpy<2，避免 ABI 不兼容
+numpy<2; python_version < "3.13" and platform_system == "Darwin" and platform_machine == "x86_64"
+# Intel Mac(x86_64) 上 torch 2.4+ 无官方 wheel，固定到 2.2.2
+torch==2.2.2; python_version < "3.13" and platform_system == "Darwin" and platform_machine == "x86_64"
+# 其他平台走较新版本（避免使用 not(...)，兼容 uv 解析器）
+torch>=2.4.0; python_version < "3.13" and platform_system == "Linux"
+torch>=2.4.0; python_version < "3.13" and platform_system == "Windows"
+torch>=2.4.0; python_version < "3.13" and platform_system == "Darwin" and platform_machine == "arm64"
 
 # ----------------------------------------------------------------------------
 # 社区集成和工具
@@ -148,9 +156,9 @@ aiohttp>=3.10.0
 # SQLite Checkpointer - LangGraph 持久化（必需）
 langgraph-checkpoint-sqlite>=3.0.0
 
-# PostgreSQL（可选）
-# psycopg2-binary>=2.9.0
-# 或使用异步版本
+# PostgreSQL（生产推荐）
+psycopg[binary]>=3.2.0
+# 异步版本（可选）
 # asyncpg>=0.29.0
 
 # Redis（可选，用于缓存）

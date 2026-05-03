@@ -12,21 +12,22 @@
 - parse_simple_pdf()    使用 PyPDFLoader 解析
 - parse_advanced_pdf()  使用 UnstructuredPDFLoader 解析（可选）
 - chunk_documents()     文本切片
-- embed_and_store()     向量化 + ChromaDB 入库
+- embed_and_store()     向量化 + PostgreSQL 入库
 - build_ingestion_graph()  构建 LangGraph 入库工作流
 """
 
 from pathlib import Path
+import json
 
 from langchain_core.documents import Document
 from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_chroma import Chroma
 
 from config import (
     CHUNK_SIZE,
     CHUNK_OVERLAP,
+    PG_TABLE_NAME,
     get_embeddings,
-    get_chroma_store,
+    get_pg_connection,
 )
 from graph_state import IngestionState
 
@@ -174,56 +175,84 @@ def separate_by_element_type(
 def embed_and_store(
     chunks: list[Document],
     collection_name: str = "enterprise_rag",
-) -> Chroma:
+) -> int:
     """
-    将文档切片向量化并存入 ChromaDB
-
-    流程：chunks → Embedding → ChromaDB.upsert
-    ChromaDB 自动持久化到 config.CHROMA_DIR。
+    将文档切片向量化并存入 PostgreSQL（pgvector + FTS）
 
     参数:
         chunks: 文档切片列表
-        collection_name: ChromaDB 集合名
+        collection_name: 逻辑集合名（多租户/多业务隔离字段）
 
     返回:
-        ChromaDB 实例
+        实际写入条数
     """
+    if not chunks:
+        return 0
+
+    # init_postgres_schema()  # 生产环境使用预先执行的 SQL 管理表结构
     embeddings = get_embeddings()
-    vectorstore = get_chroma_store(embeddings, collection_name)
+    vectors = embeddings.embed_documents([c.page_content for c in chunks])
 
     # 为每个 chunk 生成唯一 ID（基于内容哈希 + 来源），避免重复入库
-    ids = []
-    for i, chunk in enumerate(chunks):
+    rows: list[tuple[str, str, str, str, str]] = []
+    for i, (chunk, vec) in enumerate(zip(chunks, vectors)):
         source = chunk.metadata.get("source", "unknown")
         page = chunk.metadata.get("page", 0)
         content_hash = hashlib.md5(
             chunk.page_content.encode("utf-8")
         ).hexdigest()[:8]
-        ids.append(f"{Path(source).stem}_p{page}_{content_hash}_{i}")
+        doc_id = f"{collection_name}_{Path(source).stem}_p{page}_{content_hash}_{i}"
+        rows.append(
+            (
+                doc_id,
+                collection_name,
+                chunk.page_content,
+                json.dumps(chunk.metadata, ensure_ascii=False),
+                str(vec),
+            )
+        )
 
-    # ChromaDB 的 add_documents 支持批量写入
-    vectorstore.add_documents(documents=chunks, ids=ids)
+    with get_pg_connection() as conn:
+        with conn.cursor() as cur:
+            cur.executemany(
+                f"""
+                INSERT INTO {PG_TABLE_NAME}
+                (id, collection_name, content, metadata, content_tsv, embedding)
+                VALUES (
+                    %s, %s, %s, %s::jsonb,
+                    to_tsvector('simple', %s),
+                    %s::vector
+                )
+                ON CONFLICT (id) DO UPDATE SET
+                    collection_name = EXCLUDED.collection_name,
+                    content = EXCLUDED.content,
+                    metadata = EXCLUDED.metadata,
+                    content_tsv = EXCLUDED.content_tsv,
+                    embedding = EXCLUDED.embedding
+                """,
+                [(r[0], r[1], r[2], r[3], r[2], r[4]) for r in rows],
+            )
+        conn.commit()
 
-    return vectorstore
+    return len(rows)
 
 
 def reset_collection(collection_name: str = "enterprise_rag"):
     """
-    清空指定集合（用于重复运行示例时避免重复数据）
+    清空指定逻辑集合（用于重复运行示例时避免重复数据）
 
     参数:
         collection_name: 要清空的集合名
     """
-    import chromadb
-
-    from config import CHROMA_DIR
-
-    client = chromadb.PersistentClient(path=str(CHROMA_DIR))
-    try:
-        client.delete_collection(collection_name)
-        print(f"  [OK] 已清空集合: {collection_name}")
-    except Exception:
-        pass  # 集合不存在时忽略
+    # init_postgres_schema()  # 生产环境使用预先执行的 SQL 管理表结构
+    with get_pg_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                f"DELETE FROM {PG_TABLE_NAME} WHERE collection_name = %s",
+                (collection_name,),
+            )
+        conn.commit()
+    print(f"  [OK] 已清空集合: {collection_name}")
 
 
 # ============================================================================

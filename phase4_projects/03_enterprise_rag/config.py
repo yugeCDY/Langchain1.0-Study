@@ -11,6 +11,7 @@ from pathlib import Path
 from dotenv import load_dotenv
 from langchain.chat_models import init_chat_model
 from langchain_huggingface import HuggingFaceEmbeddings
+import psycopg
 
 # ============================================================================
 # 环境变量
@@ -66,7 +67,19 @@ CHUNK_OVERLAP = 50         # 相邻块重叠字符数（防止信息截断）
 RETRIEVAL_K = 5            # 每路召回的文档数
 RERANK_TOP_N = 3           # 重排序后保留的文档数
 ENSEMBLE_WEIGHTS = [0.4, 0.6]  # [BM25 权重, Vector 权重]
+RRF_K = 60                 # RRF 融合平滑项（越大越平滑）
 RELEVANCE_THRESHOLD = 0.7  # 文档充分性评分阈值（低于此值触发 fallback）
+
+# ============================================================================
+# PostgreSQL 配置（生产推荐）
+# ============================================================================
+
+POSTGRES_DSN = os.getenv(
+    "POSTGRES_DSN",
+    "postgresql://postgres:153250@111.229.94.194:5432/vector_db",
+)
+PG_TABLE_NAME = os.getenv("PG_TABLE_NAME", "rag_documents")
+EMBEDDING_DIM = int(os.getenv("EMBEDDING_DIM", "384"))
 
 # ============================================================================
 # 工厂函数
@@ -118,3 +131,56 @@ def get_chroma_store(
         embedding_function=embeddings,
         persist_directory=str(CHROMA_DIR),
     )
+
+
+def get_pg_connection():
+    """获取 PostgreSQL 连接。"""
+    return psycopg.connect(POSTGRES_DSN)
+
+
+def init_postgres_schema():
+    """
+    初始化 PostgreSQL 表结构与索引。
+
+    依赖扩展：
+    - pgvector（向量检索）
+    """
+    with get_pg_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("CREATE EXTENSION IF NOT EXISTS vector")
+            cur.execute(
+                f"""
+                CREATE TABLE IF NOT EXISTS {PG_TABLE_NAME} (
+                    id TEXT PRIMARY KEY,
+                    collection_name TEXT NOT NULL,
+                    content TEXT NOT NULL,
+                    metadata JSONB NOT NULL DEFAULT '{{}}'::jsonb,
+                    content_tsv tsvector,
+                    embedding vector({EMBEDDING_DIM}),
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+                )
+                """
+            )
+            cur.execute(
+                f"""
+                CREATE INDEX IF NOT EXISTS idx_{PG_TABLE_NAME}_collection
+                ON {PG_TABLE_NAME} (collection_name)
+                """
+            )
+            cur.execute(
+                f"""
+                CREATE INDEX IF NOT EXISTS idx_{PG_TABLE_NAME}_content_tsv
+                ON {PG_TABLE_NAME}
+                USING GIN (content_tsv)
+                """
+            )
+            # ivfflat 需要在数据量较大时配合 ANALYZE 才能发挥效果。
+            cur.execute(
+                f"""
+                CREATE INDEX IF NOT EXISTS idx_{PG_TABLE_NAME}_embedding_ivfflat
+                ON {PG_TABLE_NAME}
+                USING ivfflat (embedding vector_cosine_ops)
+                WITH (lists = 100)
+                """
+            )
+        conn.commit()

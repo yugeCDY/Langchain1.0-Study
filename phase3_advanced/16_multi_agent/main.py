@@ -37,9 +37,10 @@ if not API_KEY:
     raise ValueError("请先设置 OPENAI_API_KEY")
 
 model = init_chat_model(
-    "openai:glm-5.1",
-    api_key=API_KEY,
-    base_url=BASE_URL,
+    "deepseek:deepseek-v4-flash",  # Groq 提供的 Llama 3.3 模型
+    api_key=GROQ_API_KEY,
+    base_url="https://api.deepseek.com",
+    extra_body={"thinking": {"type": "disabled"}},
 )
 
 from langchain_core.tools import tool

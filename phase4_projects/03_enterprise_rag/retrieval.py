@@ -16,16 +16,17 @@
 """
 
 from langchain_core.documents import Document
-from langchain_chroma import Chroma
 
 from config import (
+    PG_TABLE_NAME,
     RETRIEVAL_K,
     RERANK_TOP_N,
     ENSEMBLE_WEIGHTS,
+    RRF_K,
     RELEVANCE_THRESHOLD,
     get_llm,
     get_embeddings,
-    get_chroma_store,
+    get_pg_connection,
 )
 from graph_state import RetrievalState
 
@@ -81,38 +82,57 @@ def rewrite_query(query: str, llm=None) -> list[str]:
 
 def vector_search(
     queries: list[str],
-    vectorstore: Chroma,
+    _vectorstore=None,
     k: int = RETRIEVAL_K,
+    collection_name: str = "enterprise_rag",
 ) -> list[Document]:
     """
     向量语义检索：对每个查询变体执行 similarity_search，合并结果
 
     参数:
         queries: 查询列表（原始 + 改写变体）
-        vectorstore: ChromaDB 向量库实例
+        vectorstore: 兼容参数（PG 版本中忽略）
         k: 每个查询召回的文档数
 
     返回:
         去重后的文档列表
     """
-    seen_hashes = set()
-    results = []
+    from utils import content_hash
 
-    for q in queries:
-        docs = vectorstore.similarity_search(q, k=k)
-        for doc in docs:
-            h = hash(doc.page_content)
-            if h not in seen_hashes:
-                seen_hashes.add(h)
-                results.append(doc)
+    # init_postgres_schema()  # 生产环境使用预先执行的 SQL 管理表结构
+    emb = get_embeddings()
+    seen_hashes = set()
+    results: list[Document] = []
+
+    with get_pg_connection() as conn:
+        with conn.cursor() as cur:
+            for q in queries:
+                q_vec = emb.embed_query(q)
+                cur.execute(
+                    f"""
+                    SELECT content, metadata
+                    FROM {PG_TABLE_NAME}
+                    WHERE collection_name = %s
+                    ORDER BY embedding <=> %s::vector
+                    LIMIT %s
+                    """,
+                    (collection_name, str(q_vec), k),
+                )
+                for content, metadata in cur.fetchall():
+                    h = content_hash(content)
+                    if h in seen_hashes:
+                        continue
+                    seen_hashes.add(h)
+                    results.append(Document(page_content=content, metadata=metadata))
 
     return results
 
 
 def bm25_search(
     queries: list[str],
-    documents: list[Document],
+    documents: list[Document] | None = None,
     k: int = RETRIEVAL_K,
+    collection_name: str = "enterprise_rag",
 ) -> list[Document]:
     """
     BM25 关键词检索：基于词频的精确匹配检索
@@ -128,20 +148,52 @@ def bm25_search(
     返回:
         去重后的文档列表
     """
-    from langchain_community.retrievers import BM25Retriever
+    from utils import content_hash
 
-    bm25 = BM25Retriever.from_documents(documents, k=k)
+    # 兼容旧接口：若调用方仍传入 documents，则沿用内存 BM25 逻辑。
+    if documents is not None:
+        from langchain_community.retrievers import BM25Retriever
 
-    seen_hashes = set()
-    results = []
-
-    for q in queries:
-        docs = bm25.invoke(q)
-        for doc in docs:
-            h = hash(doc.page_content)
-            if h not in seen_hashes:
+        bm25 = BM25Retriever.from_documents(documents, k=k)
+        seen_hashes = set()
+        results: list[Document] = []
+        for q in queries:
+            docs = bm25.invoke(q)
+            for doc in docs:
+                h = content_hash(doc.page_content)
+                if h in seen_hashes:
+                    continue
                 seen_hashes.add(h)
                 results.append(doc)
+        return results
+
+    # init_postgres_schema()  # 生产环境使用预先执行的 SQL 管理表结构
+    seen_hashes = set()
+    results: list[Document] = []
+
+    with get_pg_connection() as conn:
+        with conn.cursor() as cur:
+            for q in queries:
+                cur.execute(
+                    f"""
+                    SELECT content, metadata
+                    FROM {PG_TABLE_NAME}
+                    WHERE collection_name = %s
+                      AND content_tsv @@ websearch_to_tsquery('simple', %s)
+                    ORDER BY ts_rank_cd(
+                        content_tsv,
+                        websearch_to_tsquery('simple', %s)
+                    ) DESC
+                    LIMIT %s
+                    """,
+                    (collection_name, q, q, k),
+                )
+                for content, metadata in cur.fetchall():
+                    h = content_hash(content)
+                    if h in seen_hashes:
+                        continue
+                    seen_hashes.add(h)
+                    results.append(Document(page_content=content, metadata=metadata))
 
     return results
 
@@ -156,37 +208,55 @@ def merge_and_deduplicate(
     bm25_results: list[Document],
 ) -> list[Document]:
     """
-    合并向量检索和 BM25 检索结果，按内容去重
+    使用 RRF（Reciprocal Rank Fusion）融合向量检索和 BM25 结果
 
-    去重策略：基于 page_content 的哈希值。
-    保留先出现的文档（通常来自更相关的路径）。
+    RRF 分数：
+        score(d) = sum_i weight_i / (rrf_k + rank_i(d))
+
+    - rank 从 1 开始，名次越靠前贡献越高
+    - 不直接混合原始分数，避免不同检索器分值不可比问题
+    - 最终按融合分数降序返回，同时按内容去重
 
     参数:
         vector_results: 向量检索结果
         bm25_results: BM25 检索结果
 
     返回:
-        去重合并后的文档列表
+        RRF 融合后的文档列表（按相关性降序）
     """
     from utils import content_hash
 
-    seen = set()
-    merged = []
+    # RRF 平滑参数：值越大，不同 rank 的差距越小
+    rrf_k = RRF_K
+    bm25_weight, vector_weight = ENSEMBLE_WEIGHTS
 
-    # 向量结果优先
-    for doc in vector_results:
+    doc_store: dict[str, Document] = {}
+    fused_scores: dict[str, float] = {}
+
+    # 向量通道贡献
+    for rank, doc in enumerate(vector_results, start=1):
         h = content_hash(doc.page_content)
-        if h not in seen:
-            seen.add(h)
-            merged.append(doc)
+        if h not in doc_store:
+            doc_store[h] = doc
+        fused_scores[h] = fused_scores.get(h, 0.0) + (
+            vector_weight / (rrf_k + rank)
+        )
 
-    for doc in bm25_results:
+    # BM25 通道贡献
+    for rank, doc in enumerate(bm25_results, start=1):
         h = content_hash(doc.page_content)
-        if h not in seen:
-            seen.add(h)
-            merged.append(doc)
+        if h not in doc_store:
+            doc_store[h] = doc
+        fused_scores[h] = fused_scores.get(h, 0.0) + (
+            bm25_weight / (rrf_k + rank)
+        )
 
-    return merged
+    ranked_hashes = sorted(
+        fused_scores.keys(),
+        key=lambda x: fused_scores[x],
+        reverse=True,
+    )
+    return [doc_store[h] for h in ranked_hashes]
 
 
 # ============================================================================
@@ -429,8 +499,9 @@ def _route_by_score(state: RetrievalState) -> str:
 
 
 def build_retrieval_graph(
-    vectorstore: Chroma,
-    all_documents: list[Document],
+    vectorstore=None,
+    all_documents: list[Document] | None = None,
+    collection_name: str = "enterprise_rag",
 ) -> StateGraph:
     """
     构建检索生成 LangGraph 工作流
@@ -443,8 +514,8 @@ def build_retrieval_graph(
     合并部分（fan-in）：通过 reducer 自动合并结果到 merge 节点
 
     参数:
-        vectorstore: ChromaDB 实例
-        all_documents: 用于构建 BM25 索引的完整文档集
+        vectorstore: 兼容参数（PG 版本中忽略）
+        all_documents: 兼容参数；如传入则沿用内存 BM25
 
     返回:
         编译后的 StateGraph
@@ -452,12 +523,20 @@ def build_retrieval_graph(
     # 通过闭包捕获 vectorstore 和 documents
     def _vector_node(state: RetrievalState) -> dict:
         queries = state.get("rewritten_queries", [state["original_query"]])
-        results = vector_search(queries, vectorstore)
+        results = vector_search(
+            queries,
+            vectorstore,
+            collection_name=collection_name,
+        )
         return {"vector_results": results}
 
     def _bm25_node(state: RetrievalState) -> dict:
         queries = state.get("rewritten_queries", [state["original_query"]])
-        results = bm25_search(queries, all_documents)
+        results = bm25_search(
+            queries,
+            documents=all_documents,
+            collection_name=collection_name,
+        )
         return {"bm25_results": results}
 
     builder = StateGraph(RetrievalState)

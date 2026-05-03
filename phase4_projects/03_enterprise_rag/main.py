@@ -3,7 +3,7 @@ LangChain 1.0 - 企业级 RAG 系统 (Enterprise RAG System)
 =========================================================
 
 本模块重点讲解：
-1. 文档入库流水线（解析 → 切片 → Embedding → ChromaDB）
+1. 文档入库流水线（解析 → 切片 → Embedding → PostgreSQL）
 2. LangGraph 编排入库和检索工作流
 3. 多模态文档处理（表格提取）
 4. Embedding 模型选择与对比
@@ -29,21 +29,18 @@ from config import (
     LLM_MODEL_NAME,
     EMBEDDING_MODEL_DEFAULT,
     EMBEDDING_MODEL_MULTILINGUAL,
-    get_llm,
+    PG_TABLE_NAME,
     get_embeddings,
-    get_chroma_store,
+    get_pg_connection,
     SAMPLES_DIR,
-    CHROMA_DIR,
 )
 from utils import (
     print_title,
     print_section,
     print_points,
     print_warning,
-    print_tip,
     ensure_dirs,
     truncate_text,
-    format_sources,
     create_sample_documents,
 )
 
@@ -64,6 +61,18 @@ model = init_chat_model(
 )
 
 
+def get_collection_count(collection_name: str) -> int:
+    """获取指定逻辑集合中的文档数量。"""
+    # init_postgres_schema()  # 生产环境使用预先执行的 SQL 管理表结构
+    with get_pg_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                f"SELECT COUNT(*) FROM {PG_TABLE_NAME} WHERE collection_name = %s",
+                (collection_name,),
+            )
+            return int(cur.fetchone()[0])
+
+
 # ============================================================================
 # 示例 1：基础文档入库流水线
 # ============================================================================
@@ -74,7 +83,7 @@ def example_1_basic_ingestion():
     示例1：基础文档入库流水线
 
     核心流程：PDF → PyPDFLoader → RecursiveCharacterTextSplitter
-             → HuggingFaceEmbeddings → ChromaDB
+             → HuggingFaceEmbeddings → PostgreSQL(pgvector + FTS)
 
     这是最基础的 RAG 入库链，不涉及 LangGraph，
     先理解每个组件的作用，再在后续示例中用图编排。
@@ -108,19 +117,20 @@ def example_1_basic_ingestion():
     for i, chunk in enumerate(chunks[:3]):
         print(f"  - 块 {i}: {truncate_text(chunk.page_content, 60)}")
 
-    # Step 3: Embedding + ChromaDB 入库
+    # Step 3: Embedding + PostgreSQL 入库
     print_section("Step 3: Embedding + 入库")
     from ingestion import embed_and_store, reset_collection
 
     # 先清空集合，避免重复数据
     reset_collection("example1_basic")
 
-    vectorstore = embed_and_store(chunks, collection_name="example1_basic")
-    print(f"  向量库文档数: {vectorstore._collection.count()}")
+    embed_and_store(chunks, collection_name="example1_basic")
+    print(f"  向量库文档数: {get_collection_count('example1_basic')}")
 
     # Step 4: 验证检索
     print_section("Step 4: 验证检索效果")
-    results = vectorstore.similarity_search("RAG 技术", k=2)
+    from retrieval import vector_search
+    results = vector_search(["RAG 技术"], collection_name="example1_basic", k=2)
     print(f"  查询: 'RAG 技术' → 命中 {len(results)} 条")
     for doc in results:
         print(f"  - {truncate_text(doc.page_content, 80)}")
@@ -129,11 +139,11 @@ def example_1_basic_ingestion():
     print_points(
         "PyPDFLoader 按页解析，每页一个 Document",
         "RecursiveCharacterTextSplitter 优先按段落切分",
-        "ChromaDB 自动持久化到本地目录",
-        "similarity_search 返回语义最相关的文档",
+        "PostgreSQL 保存原文 + tsvector + embedding",
+        "pgvector 支持语义相似度检索",
     )
 
-    return vectorstore
+    return results
 
 
 # ============================================================================
@@ -188,8 +198,7 @@ def example_2_graph_ingestion():
             print_warning(err)
 
     # 验证入库结果
-    vs = get_chroma_store(collection_name="enterprise_rag")
-    print(f"  ChromaDB 文档数: {vs._collection.count()}")
+    print(f"  PG 文档数: {get_collection_count('enterprise_rag')}")
 
     print("\n关键点：")
     print_points(
@@ -256,7 +265,7 @@ def example_3_multimodal_processing():
 
     reset_collection("example3_multimodal")
 
-    graph = build_multimodal_ingestion_graph()
+    _graph = build_multimodal_ingestion_graph()
     # ↑ 这个图在 parse 后按 element_type 分流，表格和文本走不同路径
 
     # 重新编译使用不同的集合名
@@ -361,9 +370,8 @@ def example_5_hybrid_retrieval_reranking():
     print_title("示例 5：混合检索 + 重排序")
 
     # 确保有数据
-    vs = get_chroma_store(collection_name="enterprise_rag")
-    if vs._collection.count() == 0:
-        print_warning("向量库为空，先运行示例 2 入库数据")
+    if get_collection_count("enterprise_rag") == 0:
+        print_warning("PG 集合为空，先运行示例 2 入库数据")
         return None
 
     query = "哪个模型 MMLU 分数最高？"
@@ -373,18 +381,16 @@ def example_5_hybrid_retrieval_reranking():
     print_section("Step 1: 向量检索")
     from retrieval import vector_search
 
-    vec_results = vector_search([query], vs)
+    vec_results = vector_search([query], collection_name="enterprise_rag")
     print(f"  向量检索命中: {len(vec_results)} 条")
     for doc in vec_results[:3]:
         print(f"  - {truncate_text(doc.page_content, 70)}")
 
     # Step 2: BM25 检索
     print_section("Step 2: BM25 关键词检索")
-    # 从 ChromaDB 获取所有文档构建 BM25 索引
-    all_docs = vs.similarity_search("", k=vs._collection.count())
     from retrieval import bm25_search
 
-    bm25_results = bm25_search([query], all_docs)
+    bm25_results = bm25_search([query], collection_name="enterprise_rag")
     print(f"  BM25 命中: {len(bm25_results)} 条")
     for doc in bm25_results[:3]:
         print(f"  - {truncate_text(doc.page_content, 70)}")
@@ -414,7 +420,7 @@ def example_5_hybrid_retrieval_reranking():
         "CrossEncoder 比 bi-encoder 更准但更慢",
     )
 
-    return vs, all_docs
+    return vec_results, bm25_results
 
 
 # ============================================================================
@@ -438,9 +444,8 @@ def example_6_adaptive_generation():
     """
     print_title("示例 6：CRAG 文档评分 + 自适应生成")
 
-    vs = get_chroma_store(collection_name="enterprise_rag")
-    if vs._collection.count() == 0:
-        print_warning("向量库为空，先运行示例 2 入库数据")
+    if get_collection_count("enterprise_rag") == 0:
+        print_warning("PG 集合为空，先运行示例 2 入库数据")
         return None
 
     # 测试两个查询：一个知识库能答，一个不能答
@@ -455,8 +460,6 @@ def example_6_adaptive_generation():
         grade_documents, generate_answer,
     )
 
-    all_docs = vs.similarity_search("", k=vs._collection.count())
-
     for query in test_queries:
         print_section(f"查询: {query}")
 
@@ -464,8 +467,8 @@ def example_6_adaptive_generation():
         queries = rewrite_query(query)
         print(f"  改写后: {queries}")
 
-        vec_results = vector_search(queries, vs)
-        bm25_results = bm25_search(queries, all_docs)
+        vec_results = vector_search(queries, collection_name="enterprise_rag")
+        bm25_results = bm25_search(queries, collection_name="enterprise_rag")
         merged = merge_and_deduplicate(vec_results, bm25_results)
 
         if merged:
@@ -529,8 +532,7 @@ def example_7_full_pipeline():
     reset_collection("example7_full")
     pages = parse_simple_pdf(pdf_path)
     chunks = chunk_documents(pages)
-    vectorstore = embed_and_store(chunks, collection_name="example7_full")
-    all_docs = chunks  # BM25 需要原始文档
+    embed_and_store(chunks, collection_name="example7_full")
 
     print(f"  入库完成: {len(chunks)} 个切片")
 
@@ -540,7 +542,7 @@ def example_7_full_pipeline():
     print("  START → rewrite → [vector + bm25] → merge → rerank → grade")
     print("         grade → generate (评分够) / fallback (评分不够) → END")
 
-    retrieval_graph = build_retrieval_graph(vectorstore, all_docs)
+    retrieval_graph = build_retrieval_graph(collection_name="example7_full")
 
     # Step 3: 执行查询
     test_queries = [
@@ -578,7 +580,7 @@ def example_7_full_pipeline():
     print("  检索图: rewrite → [vector + bm25] → merge → rerank → grade → generate")
     print("\n核心技术：")
     print_points(
-        "ChromaDB 向量库（本地持久化）",
+        "PostgreSQL + pgvector + FTS（统一存储）",
         "HuggingFace Embeddings（免费离线）",
         "BM25 + Vector 混合检索",
         "CrossEncoder 精确重排序",
@@ -626,7 +628,7 @@ def main():
         print("=" * 70)
         print("\n核心要点：")
         print_points(
-            "文档入库：解析 → 切片 → Embedding → ChromaDB",
+            "文档入库：解析 → 切片 → Embedding → PostgreSQL",
             "LangGraph 编排：StateGraph 管理流水线状态",
             "多模态支持：UnstructuredPDFLoader 识别表格/图片",
             "混合检索：BM25（精确）+ Vector（语义）双路召回",
