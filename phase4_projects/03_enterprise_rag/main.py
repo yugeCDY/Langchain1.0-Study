@@ -29,6 +29,8 @@ from config import (
     LLM_MODEL_NAME,
     EMBEDDING_MODEL_DEFAULT,
     EMBEDDING_MODEL_MULTILINGUAL,
+    LANGSMITH_PROJECT,
+    LANGSMITH_TRACING,
     PG_TABLE_NAME,
     get_embeddings,
     get_pg_connection,
@@ -58,7 +60,28 @@ model = init_chat_model(
     LLM_MODEL_NAME,
     api_key=API_KEY,
     base_url=BASE_URL,
+    extra_body={"thinking": {"type": "disabled"}},
 )
+
+
+def _print_langsmith_status():
+    """打印 LangSmith 追踪状态。"""
+    if LANGSMITH_TRACING:
+        print(f"  LangSmith tracing: ON  (project={LANGSMITH_PROJECT})")
+    else:
+        print("  LangSmith tracing: OFF")
+
+
+def _flush_langsmith_traces():
+    """刷新 LangSmith traces，避免脚本快速退出时丢失。"""
+    if not LANGSMITH_TRACING:
+        return
+    try:
+        from langchain_core.tracers.langchain import wait_for_all_tracers
+
+        wait_for_all_tracers()
+    except Exception:
+        pass
 
 
 def get_collection_count(collection_name: str) -> int:
@@ -177,7 +200,7 @@ def example_2_graph_ingestion():
     print("  入库图结构: START → parse → chunk → store → END")
 
     # 清空旧数据
-    reset_collection("enterprise_rag")
+    reset_collection("resume_kb")
 
     # 执行入库图
     print_section("执行入库图")
@@ -198,7 +221,7 @@ def example_2_graph_ingestion():
             print_warning(err)
 
     # 验证入库结果
-    print(f"  PG 文档数: {get_collection_count('enterprise_rag')}")
+    print(f"  PG 文档数: {get_collection_count('resume_kb')}")
 
     print("\n关键点：")
     print_points(
@@ -214,77 +237,77 @@ def example_2_graph_ingestion():
 # ============================================================================
 
 
-def example_3_multimodal_processing():
+def example_3_multimodal_processing(
+    domain: str = "resume_kb",
+    allowed_roles: list[str] | None = None,
+):
     """
-    示例3：多模态文档处理（表格/图片识别）
+    示例3：多格式多模态文档处理（PDF + DOCX + CSV）
 
-    使用 UnstructuredPDFLoader 识别文档中的结构化元素：
-    - NarrativeText: 正文
-    - Table: 表格
-    - Title: 标题
-
-    表格元素不切片（保留完整结构），文本元素正常切片。
-    两种元素通过不同路径处理后统一入库。
-
-    注意：需要 pip install "unstructured[pdf]"
-    未安装时自动 fallback 到 PyPDFLoader。
+    核心策略：
+    - 按文件类型自动选择解析器
+    - 文本走两阶段切分（parent/child）
+    - 表格整块保留（避免破坏结构）
+    - 按业务域分集合入库
+    - metadata 写入 language + ACL + version + is_active
     """
     print_title("示例 3：多模态文档处理")
 
-    pdf_path = str(SAMPLES_DIR / "tech_report_sample.pdf")
-    if not os.path.exists(pdf_path):
-        print_warning("样本 PDF 不存在，跳过")
+    samples_dir = str(SAMPLES_DIR)
+    if not os.path.exists(samples_dir):
+        print_warning("样本目录不存在，跳过")
         return None
 
-    # 尝试高级解析
-    print_section("解析文档结构")
-    from ingestion import parse_advanced_pdf, separate_by_element_type
+    # 业务域集合：建议按领域拆分，而不是按格式拆分
+    collection_name = domain
+    roles = allowed_roles or ["hr", "ops"]
 
-    elements = parse_advanced_pdf(pdf_path)
-    text_docs, table_docs = separate_by_element_type(elements)
+    print_section("Step 1: 批量解析目录（PDF + DOCX + CSV）")
+    from ingestion import parse_documents_in_dir, separate_by_element_type
 
-    print(f"  总元素数: {len(elements)}")
+    documents, parse_stats = parse_documents_in_dir(
+        directory=samples_dir,
+        domain=domain,
+        collection_name=collection_name,
+        allowed_roles=roles,
+    )
+    if not documents:
+        print_warning("未解析到可用文档，跳过")
+        if parse_stats.get("errors"):
+            for err in parse_stats["errors"]:
+                print_warning(err)
+        return None
+
+    text_docs, table_docs = separate_by_element_type(documents)
+    print(f"  扫描文件数: {parse_stats['total_files']}")
+    print(f"  解析成功/失败: {parse_stats['parsed_files']}/{parse_stats['failed_files']}")
+    print(f"  格式分布: {parse_stats['by_type']}")
     print(f"  文本元素: {len(text_docs)}")
     print(f"  表格元素: {len(table_docs)}")
+    if parse_stats.get("errors"):
+        print("  解析错误:")
+        for err in parse_stats["errors"][:5]:
+            print(f"    - {err}")
 
-    # 统计元素类型
-    from collections import Counter
-    type_counts = Counter(
-        d.metadata.get("element_type", "unknown") for d in elements
-    )
-    print(f"  元素类型分布: {dict(type_counts)}")
-
-    if table_docs:
-        print_section("提取的表格内容")
-        for i, table in enumerate(table_docs[:2]):
-            print(f"  表格 {i+1}: {truncate_text(table.page_content, 80)}")
-
-    # 使用多模态入库图
-    print_section("多模态入库图")
-    from ingestion import build_multimodal_ingestion_graph, reset_collection
-
-    reset_collection("example3_multimodal")
-
-    _graph = build_multimodal_ingestion_graph()
-    # ↑ 这个图在 parse 后按 element_type 分流，表格和文本走不同路径
-
-    # 重新编译使用不同的集合名
-    # 这里直接用函数式演示流程
+    print_section("Step 2: 切分与质量门控")
     from ingestion import chunk_documents, embed_and_store
 
     text_chunks = chunk_documents(text_docs) if text_docs else []
     all_chunks = text_chunks + table_docs
-    if all_chunks:
-        reset_collection("example3_multimodal")
-        embed_and_store(all_chunks, collection_name="example3_multimodal")
-        print(f"  入库切片数: {len(all_chunks)} (文本 {len(text_chunks)} + 表格 {len(table_docs)})")
+    print(f"  切分后: 文本 {len(text_chunks)} + 表格 {len(table_docs)}")
+
+    print_section("Step 3: 入库（按业务域集合）")
+    inserted = embed_and_store(all_chunks, collection_name=collection_name)
+    print(f"  实际入库条数: {inserted}")
+    print(f"  集合总文档数({collection_name}): {get_collection_count(collection_name)}")
 
     print("\n关键点：")
     print_points(
-        "UnstructuredPDFLoader 识别文档中的结构化元素",
-        "表格元素保留原文不切片，避免破坏表格结构",
-        "未安装 unstructured 时自动 fallback 到 PyPDFLoader",
-        "多模态入库图用条件路由按元素类型分流处理",
+        "多格式统一入口：PDF/DOCX/CSV 自动分派解析",
+        "文本分层切分，表格整块保留",
+        "按业务域分集合（示例：resume_kb）",
+        "metadata 包含 language/allowed_roles/doc_id/version/is_active",
+        "检索端可基于 ACL + 业务域做强制过滤",
     )
 
 
@@ -363,25 +386,25 @@ def example_5_hybrid_retrieval_reranking():
     1. 向量检索：理解语义，但可能漏掉精确匹配
     2. BM25 检索：精确关键词匹配，但不理解语义
     3. 合并去重：两路结果合并
-    4. CrossEncoder 重排序：精确排序，取 top-3
+    4. CrossEncoder 重排序：精确排序，取 top-5
 
     这就是企业级 RAG 的标准检索管线。
     """
     print_title("示例 5：混合检索 + 重排序")
 
     # 确保有数据
-    if get_collection_count("enterprise_rag") == 0:
+    if get_collection_count("resume_kb") == 0:
         print_warning("PG 集合为空，先运行示例 2 入库数据")
         return None
 
-    query = "哪个模型 MMLU 分数最高？"
+    query = "陈定煜毕业于哪个学校"
     print(f"  查询: {query}")
 
     # Step 1: 向量检索
     print_section("Step 1: 向量检索")
     from retrieval import vector_search
 
-    vec_results = vector_search([query], collection_name="enterprise_rag")
+    vec_results = vector_search([query], collection_name="resume_kb")
     print(f"  向量检索命中: {len(vec_results)} 条")
     for doc in vec_results[:3]:
         print(f"  - {truncate_text(doc.page_content, 70)}")
@@ -390,7 +413,7 @@ def example_5_hybrid_retrieval_reranking():
     print_section("Step 2: BM25 关键词检索")
     from retrieval import bm25_search
 
-    bm25_results = bm25_search([query], collection_name="enterprise_rag")
+    bm25_results = bm25_search([query], collection_name="resume_kb")
     print(f"  BM25 命中: {len(bm25_results)} 条")
     for doc in bm25_results[:3]:
         print(f"  - {truncate_text(doc.page_content, 70)}")
@@ -407,7 +430,8 @@ def example_5_hybrid_retrieval_reranking():
     print("  加载重排序模型（首次运行需下载约 80MB）...")
     from retrieval import rerank_documents
 
-    reranked = rerank_documents(query, merged)
+    # reranked = rerank_documents(query, merged)
+    reranked = merged
     print(f"  重排序后: {len(reranked)} 条")
     for i, doc in enumerate(reranked):
         print(f"  [{i+1}] {truncate_text(doc.page_content, 70)}")
@@ -444,12 +468,13 @@ def example_6_adaptive_generation():
     """
     print_title("示例 6：CRAG 文档评分 + 自适应生成")
 
-    if get_collection_count("enterprise_rag") == 0:
+    if get_collection_count("resume_kb") == 0:
         print_warning("PG 集合为空，先运行示例 2 入库数据")
         return None
 
     # 测试两个查询：一个知识库能答，一个不能答
     test_queries = [
+        "陈定煜毕业于哪个学校",
         "哪个 AI 模型的 MMLU 分数最高？",  # 应该能答
         "2024 年诺贝尔物理学奖得主是谁？",   # 知识库里没有
     ]
@@ -467,8 +492,8 @@ def example_6_adaptive_generation():
         queries = rewrite_query(query)
         print(f"  改写后: {queries}")
 
-        vec_results = vector_search(queries, collection_name="enterprise_rag")
-        bm25_results = bm25_search(queries, collection_name="enterprise_rag")
+        vec_results = vector_search(queries, collection_name="resume_kb")
+        bm25_results = bm25_search(queries, collection_name="resume_kb")
         merged = merge_and_deduplicate(vec_results, bm25_results)
 
         if merged:
@@ -517,24 +542,24 @@ def example_7_full_pipeline():
     print_title("示例 7：端到端企业级 RAG 系统")
 
     from retrieval import build_retrieval_graph
-    from ingestion import reset_collection
-
-    # Step 1: 入库
-    print_section("Step 1: 文档入库")
-
-    pdf_path = str(SAMPLES_DIR / "tech_report_sample.pdf")
-    if not os.path.exists(pdf_path):
-        print_warning("样本 PDF 不存在，跳过")
-        return
-
-    from ingestion import parse_simple_pdf, chunk_documents, embed_and_store
-
-    reset_collection("example7_full")
-    pages = parse_simple_pdf(pdf_path)
-    chunks = chunk_documents(pages)
-    embed_and_store(chunks, collection_name="example7_full")
-
-    print(f"  入库完成: {len(chunks)} 个切片")
+    # from ingestion import reset_collection
+    #
+    # # Step 1: 入库
+    # print_section("Step 1: 文档入库")
+    #
+    # pdf_path = str(SAMPLES_DIR / "tech_report_sample.pdf")
+    # if not os.path.exists(pdf_path):
+    #     print_warning("样本 PDF 不存在，跳过")
+    #     return
+    #
+    # from ingestion import parse_simple_pdf, chunk_documents, embed_and_store
+    #
+    # reset_collection("example7_full")
+    # pages = parse_simple_pdf(pdf_path)
+    # chunks = chunk_documents(pages)
+    # embed_and_store(chunks, collection_name="example7_full")
+    #
+    # print(f"  入库完成: {len(chunks)} 个切片")
 
     # Step 2: 构建检索图
     print_section("Step 2: 构建检索图")
@@ -542,12 +567,13 @@ def example_7_full_pipeline():
     print("  START → rewrite → [vector + bm25] → merge → rerank → grade")
     print("         grade → generate (评分够) / fallback (评分不够) → END")
 
-    retrieval_graph = build_retrieval_graph(collection_name="example7_full")
+    retrieval_graph = build_retrieval_graph(collection_name="resume_kb", acl_roles=["hr"])
 
     # Step 3: 执行查询
     test_queries = [
-        "RAG 在 2024 年有哪些改进？",
-        "比较不同模型的上下文窗口长度",
+        "帮我查一下陈定煜的个人资料",
+        # "RAG 在 2024 年有哪些改进？",
+        # "比较不同模型的上下文窗口长度",
     ]
 
     for query in test_queries:
@@ -598,28 +624,29 @@ def main():
     print("\n" + "=" * 70)
     print(" LangChain 1.0 - 企业级 RAG 系统")
     print("=" * 70)
+    _print_langsmith_status()
 
     # 确保目录存在
     ensure_dirs()
 
     try:
-        example_1_basic_ingestion()
-        input("\n按 Enter 继续...")
+        # example_1_basic_ingestion()
+        # input("\n按 Enter 继续...")
 
-        example_2_graph_ingestion()
-        input("\n按 Enter 继续...")
+        # example_2_graph_ingestion()
+        # input("\n按 Enter 继续...")
 
-        example_3_multimodal_processing()
-        input("\n按 Enter 继续...")
+        # example_3_multimodal_processing()
+        # input("\n按 Enter 继续...")
 
-        example_4_embedding_comparison()
-        input("\n按 Enter 继续...")
+        # example_4_embedding_comparison()
+        # input("\n按 Enter 继续...")
 
-        example_5_hybrid_retrieval_reranking()
-        input("\n按 Enter 继续...")
+        # example_5_hybrid_retrieval_reranking()
+        # input("\n按 Enter 继续...")
 
-        example_6_adaptive_generation()
-        input("\n按 Enter 继续...")
+        # example_6_adaptive_generation()
+        # input("\n按 Enter 继续...")
 
         example_7_full_pipeline()
 
@@ -646,6 +673,8 @@ def main():
         print(f"\n错误: {e}")
         import traceback
         traceback.print_exc()
+    finally:
+        _flush_langsmith_traces()
 
 
 if __name__ == "__main__":

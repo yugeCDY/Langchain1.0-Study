@@ -17,7 +17,11 @@
 """
 
 from pathlib import Path
+import csv
+import hashlib
 import json
+import re
+import time
 
 from langchain_core.documents import Document
 from langchain_text_splitters import RecursiveCharacterTextSplitter
@@ -26,6 +30,8 @@ from config import (
     CHUNK_SIZE,
     CHUNK_OVERLAP,
     PG_TABLE_NAME,
+    PG_TSV_CONFIG_EN,
+    PG_TSV_CONFIG_ZH,
     get_embeddings,
     get_pg_connection,
 )
@@ -97,9 +103,227 @@ def parse_advanced_pdf(file_path: str) -> list[Document]:
         return elements
 
     except ImportError:
-        print("  ⚠️  unstructured 未安装，使用 PyPDFLoader 替代")
-        print("  💡 安装方式：pip install \"unstructured[pdf]\"")
+        print("  [WARN] unstructured 未安装，使用 PyPDFLoader 替代")
+        print("  [TIP] 安装方式：pip install \"unstructured[pdf]\"")
         return parse_simple_pdf(file_path)
+
+
+def _detect_language(text: str) -> str:
+    """粗粒度语言识别：中文优先，其次英文，其他记为 unknown。"""
+    if not text:
+        return "unknown"
+    zh = len(re.findall(r"[\u4e00-\u9fff]", text))
+    en = len(re.findall(r"[A-Za-z]", text))
+    if zh > en:
+        return "zh"
+    if en > 0:
+        return "en"
+    return "unknown"
+
+
+def _normalize_acl(allowed_roles: list[str] | None) -> list[str]:
+    """ACL 归一化：去重并保持稳定顺序。"""
+    roles = allowed_roles or ["public"]
+    seen: set[str] = set()
+    normalized: list[str] = []
+    for role in roles:
+        r = str(role).strip()
+        if not r or r in seen:
+            continue
+        seen.add(r)
+        normalized.append(r)
+    return normalized or ["public"]
+
+
+def _build_doc_id(file_path: str, domain: str) -> str:
+    """为业务文档生成稳定 doc_id（不含版本号）。"""
+    stem = Path(file_path).stem
+    basis = f"{domain}:{stem}".encode("utf-8")
+    return f"{domain}_{hashlib.md5(basis).hexdigest()[:10]}"
+
+
+def _load_docx(file_path: str) -> list[Document]:
+    """DOCX 解析：优先结构化 loader，失败回退到纯文本 loader。"""
+    try:
+        from langchain_community.document_loaders import UnstructuredWordDocumentLoader
+
+        loader = UnstructuredWordDocumentLoader(file_path, mode="elements")
+        docs = loader.load()
+        for doc in docs:
+            doc.metadata["element_type"] = doc.metadata.get("category", "NarrativeText")
+        return docs
+    except ImportError:
+        from langchain_community.document_loaders import Docx2txtLoader
+
+        docs = Docx2txtLoader(file_path).load()
+        for doc in docs:
+            doc.metadata["element_type"] = "NarrativeText"
+        return docs
+
+
+def _read_csv_rows(file_path: str) -> list[list[str]]:
+    """读取 CSV 行，兼容 utf-8 与 gb18030。"""
+    encodings = ["utf-8-sig", "gb18030", "utf-8"]
+    last_error = None
+    for enc in encodings:
+        try:
+            with open(file_path, "r", encoding=enc, newline="") as f:
+                reader = csv.reader(f)
+                return list(reader)
+        except Exception as e:  # pragma: no cover - 编码兼容兜底
+            last_error = e
+            continue
+    raise ValueError(f"CSV 读取失败: {last_error}")
+
+
+def _load_csv_as_tables(file_path: str, rows_per_chunk: int = 30) -> list[Document]:
+    """将 CSV 作为表格块导入（保留结构，不做字符级切分）。"""
+    rows = _read_csv_rows(file_path)
+    if not rows:
+        return []
+
+    header = rows[0]
+    body = rows[1:] if len(rows) > 1 else []
+    docs: list[Document] = []
+
+    if not body:
+        content = " | ".join(header)
+        docs.append(
+            Document(
+                page_content=content,
+                metadata={
+                    "element_type": "Table",
+                    "row_start": 1,
+                    "row_end": 1,
+                },
+            )
+        )
+        return docs
+
+    for start in range(0, len(body), rows_per_chunk):
+        part = body[start:start + rows_per_chunk]
+        lines = [" | ".join(header)] + [" | ".join(row) for row in part]
+        content = "\n".join(lines)
+        docs.append(
+            Document(
+                page_content=content,
+                metadata={
+                    "element_type": "Table",
+                    "row_start": start + 2,
+                    "row_end": start + 1 + len(part),
+                },
+            )
+        )
+    return docs
+
+
+def parse_document_by_type(
+    file_path: str,
+    domain: str,
+    allowed_roles: list[str] | None = None,
+    language_hint: str | None = None,
+    version: int = 1,
+    is_active: bool = True,
+) -> list[Document]:
+    """
+    按文件类型解析单文档并标准化 metadata。
+
+    支持：PDF / DOCX / CSV
+    """
+    suffix = Path(file_path).suffix.lower()
+    if suffix == ".pdf":
+        docs = parse_advanced_pdf(file_path)
+    elif suffix == ".docx":
+        docs = _load_docx(file_path)
+    elif suffix == ".csv":
+        docs = _load_csv_as_tables(file_path)
+    else:
+        raise ValueError(f"不支持的文件类型: {suffix}")
+
+    acl = _normalize_acl(allowed_roles)
+    doc_id = _build_doc_id(file_path, domain)
+    for doc in docs:
+        text = doc.page_content or ""
+        lang = language_hint or _detect_language(text)
+        doc.metadata["source"] = file_path
+        doc.metadata["file_type"] = suffix.lstrip(".")
+        doc.metadata["domain"] = domain
+        doc.metadata["language"] = lang
+        doc.metadata["allowed_roles"] = acl
+        doc.metadata["doc_id"] = doc_id
+        doc.metadata["version"] = int(version)
+        doc.metadata["is_active"] = bool(is_active)
+        if "element_type" not in doc.metadata:
+            doc.metadata["element_type"] = "NarrativeText"
+    return docs
+
+
+def _get_next_doc_version(collection_name: str, doc_id: str) -> int:
+    """读取同 doc_id 的下一版本号（metadata 方案，无需迁移表结构）。"""
+    # init_postgres_schema()  # 生产环境使用预先执行的 SQL 管理表结构
+    with get_pg_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                f"""
+                SELECT COALESCE(MAX((metadata->>'version')::int), 0)
+                FROM {PG_TABLE_NAME}
+                WHERE collection_name = %s
+                  AND metadata ? 'doc_id'
+                  AND metadata->>'doc_id' = %s
+                """,
+                (collection_name, doc_id),
+            )
+            current = int(cur.fetchone()[0] or 0)
+    return current + 1
+
+
+def parse_documents_in_dir(
+    directory: str,
+    domain: str,
+    collection_name: str,
+    allowed_roles: list[str] | None = None,
+) -> tuple[list[Document], dict]:
+    """
+    批量解析目录中的异构文档，逐文件容错并返回统计信息。
+    """
+    support_ext = {".pdf", ".docx", ".csv"}
+    all_docs: list[Document] = []
+    stats = {
+        "total_files": 0,
+        "parsed_files": 0,
+        "failed_files": 0,
+        "by_type": {"pdf": 0, "docx": 0, "csv": 0},
+        "errors": [],
+        "timings_sec": {},
+    }
+
+    for path in sorted(Path(directory).glob("*")):
+        if not path.is_file() or path.suffix.lower() not in support_ext:
+            continue
+
+        stats["total_files"] += 1
+        start = time.time()
+        file_path = str(path)
+        doc_id = _build_doc_id(file_path, domain)
+        try:
+            version = _get_next_doc_version(collection_name, doc_id)
+            docs = parse_document_by_type(
+                file_path=file_path,
+                domain=domain,
+                allowed_roles=allowed_roles,
+                version=version,
+                is_active=True,
+            )
+            all_docs.extend(docs)
+            stats["parsed_files"] += 1
+            stats["by_type"][path.suffix.lower().lstrip(".")] += 1
+            stats["timings_sec"][path.name] = round(time.time() - start, 3)
+        except Exception as e:
+            stats["failed_files"] += 1
+            stats["timings_sec"][path.name] = round(time.time() - start, 3)
+            stats["errors"].append(f"{path.name}: {e}")
+
+    return all_docs, stats
 
 
 # ============================================================================
@@ -113,14 +337,14 @@ def chunk_documents(
     chunk_overlap: int = CHUNK_OVERLAP,
 ) -> list[Document]:
     """
-    将文档切片为适合检索的小段
+    将文档切片为适合企业检索的小段（两阶段切分）
 
-    使用 RecursiveCharacterTextSplitter，支持中英文分隔符：
-    - 优先按段落（\\n\\n）切分
-    - 再按句子（\\n、。、！、？）切分
-    - 最后按空格/字符切分
+    阶段 1（结构块）：
+    - 优先按段落/句子切成较大的 parent chunk，尽量保持语义完整
 
-    chunk_overlap 确保相邻块有重叠，防止关键信息被截断。
+    阶段 2（检索块）：
+    - 在每个 parent chunk 内继续细分为 child chunk，控制检索粒度
+    - 为 child chunk 写入 parent_chunk_id，便于后续父子块回溯/重排
 
     参数:
         documents: 原始文档列表
@@ -130,13 +354,75 @@ def chunk_documents(
     返回:
         切片后的文档列表
     """
-    splitter = RecursiveCharacterTextSplitter(
+    # 第一阶段：结构化粗切，优先保持段落和句子完整。
+    parent_splitter = RecursiveCharacterTextSplitter(
+        chunk_size=max(chunk_size * 3, chunk_size + 1),
+        chunk_overlap=min(chunk_overlap, max(chunk_size // 10, 20)),
+        separators=["\n\n", "\n", "。", "！", "？", ".", "!", "?"],
+        add_start_index=True,
+    )
+    parent_docs = parent_splitter.split_documents(documents)
+
+    # 第二阶段：在每个 parent chunk 内细切，得到检索友好的 child chunk。
+    child_splitter = RecursiveCharacterTextSplitter(
         chunk_size=chunk_size,
         chunk_overlap=chunk_overlap,
         separators=["\n\n", "\n", "。", "！", "？", ".", " ", ""],
+        add_start_index=True,
     )
-    chunks = splitter.split_documents(documents)
+
+    chunks: list[Document] = []
+    for parent_idx, parent_doc in enumerate(parent_docs):
+        source = parent_doc.metadata.get("source", "unknown")
+        page = parent_doc.metadata.get("page", 0)
+        parent_chunk_id = f"{Path(source).stem}_p{page}_parent_{parent_idx}"
+
+        child_docs = child_splitter.split_documents([parent_doc])
+        for child in child_docs:
+            # 记录父子关系，方便检索后做上下文扩展（parent recall）。
+            child.metadata["parent_chunk_id"] = parent_chunk_id
+            child.metadata["chunk_level"] = "child"
+            chunks.append(child)
+
     return chunks
+
+
+def apply_quality_gate(chunks: list[Document]) -> tuple[list[Document], int]:
+    """
+    数据质量门控：过滤空块、超短块、低信息密度块。
+
+    返回：(保留块, 被过滤数量)
+    """
+    kept: list[Document] = []
+    dropped = 0
+
+    for chunk in chunks:
+        text = (chunk.page_content or "").strip()
+        elem = str(chunk.metadata.get("element_type", "")).lower()
+        if not text:
+            dropped += 1
+            continue
+
+        # 表格块保留结构，长度门控更宽松
+        if elem == "table":
+            if len(text) < 8:
+                dropped += 1
+                continue
+            kept.append(chunk)
+            continue
+
+        if len(text) < 20:
+            dropped += 1
+            continue
+
+        info_chars = len(re.findall(r"[A-Za-z0-9\u4e00-\u9fff]", text))
+        density = info_chars / max(len(text), 1)
+        if density < 0.18:
+            dropped += 1
+            continue
+        kept.append(chunk)
+
+    return kept, dropped
 
 
 def separate_by_element_type(
@@ -157,8 +443,9 @@ def separate_by_element_type(
     table_docs = []
 
     for doc in documents:
-        elem_type = doc.metadata.get("element_type", "text")
-        if elem_type == "Table":
+        elem_type = str(doc.metadata.get("element_type", "text"))
+        file_type = str(doc.metadata.get("file_type", ""))
+        if elem_type.lower() == "table" or file_type == "csv":
             table_docs.append(doc)
         else:
             # NarrativeText, Title, Header, Unknown 等都归为文本
@@ -189,6 +476,13 @@ def embed_and_store(
     if not chunks:
         return 0
 
+    # P0：质量门控，避免低质量块污染检索
+    chunks, dropped = apply_quality_gate(chunks)
+    if dropped:
+        print(f"  [质量门控] 过滤低质量切片: {dropped}")
+    if not chunks:
+        return 0
+
     # init_postgres_schema()  # 生产环境使用预先执行的 SQL 管理表结构
     embeddings = get_embeddings()
     vectors = embeddings.embed_documents([c.page_content for c in chunks])
@@ -214,27 +508,101 @@ def embed_and_store(
 
     with get_pg_connection() as conn:
         with conn.cursor() as cur:
+            # 文档版本管理：新版本入库前将同 doc_id 历史版本标记为非激活。
+            active_doc_ids = sorted(
+                {
+                    str(c.metadata.get("doc_id"))
+                    for c in chunks
+                    if c.metadata.get("doc_id") and c.metadata.get("is_active", True)
+                }
+            )
+            for doc_id in active_doc_ids:
+                cur.execute(
+                    f"""
+                    UPDATE {PG_TABLE_NAME}
+                    SET metadata = jsonb_set(metadata, '{{is_active}}', 'false'::jsonb, true)
+                    WHERE collection_name = %s
+                      AND metadata ? 'doc_id'
+                      AND metadata->>'doc_id' = %s
+                      AND COALESCE(metadata->>'is_active', 'true') = 'true'
+                    """,
+                    (collection_name, doc_id),
+                )
+
             cur.executemany(
                 f"""
                 INSERT INTO {PG_TABLE_NAME}
-                (id, collection_name, content, metadata, content_tsv, embedding)
+                (
+                    id,
+                    collection_name,
+                    content,
+                    metadata,
+                    content_tsv_zh,
+                    content_tsv_en,
+                    embedding
+                )
                 VALUES (
                     %s, %s, %s, %s::jsonb,
-                    to_tsvector('simple', %s),
+                    to_tsvector(%s, %s),
+                    to_tsvector(%s, %s),
                     %s::vector
                 )
                 ON CONFLICT (id) DO UPDATE SET
                     collection_name = EXCLUDED.collection_name,
                     content = EXCLUDED.content,
                     metadata = EXCLUDED.metadata,
-                    content_tsv = EXCLUDED.content_tsv,
+                    content_tsv_zh = EXCLUDED.content_tsv_zh,
+                    content_tsv_en = EXCLUDED.content_tsv_en,
                     embedding = EXCLUDED.embedding
                 """,
-                [(r[0], r[1], r[2], r[3], r[2], r[4]) for r in rows],
+                [
+                    (
+                        r[0],
+                        r[1],
+                        r[2],
+                        r[3],
+                        PG_TSV_CONFIG_ZH,
+                        r[2],
+                        PG_TSV_CONFIG_EN,
+                        r[2],
+                        r[4],
+                    )
+                    for r in rows
+                ],
             )
         conn.commit()
 
     return len(rows)
+
+
+def rebuild_search_vectors(collection_name: str | None = None) -> int:
+    """
+    回填/重建双语 FTS 列。
+
+    适用于：
+    - 新增 content_tsv_zh / content_tsv_en 后回填历史数据
+    - 调整中文分词配置后批量重建检索索引源数据
+    """
+    where_clause = ""
+    params: list = []
+    if collection_name:
+        where_clause = "WHERE collection_name = %s"
+        params.append(collection_name)
+
+    with get_pg_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                f"""
+                UPDATE {PG_TABLE_NAME}
+                SET content_tsv_zh = to_tsvector(%s, content),
+                    content_tsv_en = to_tsvector(%s, content)
+                {where_clause}
+                """,
+                [PG_TSV_CONFIG_ZH, PG_TSV_CONFIG_EN, *params],
+            )
+            updated = cur.rowcount or 0
+        conn.commit()
+    return updated
 
 
 def reset_collection(collection_name: str = "enterprise_rag"):
@@ -258,8 +626,6 @@ def reset_collection(collection_name: str = "enterprise_rag"):
 # ============================================================================
 # LangGraph 入库工作流
 # ============================================================================
-
-import hashlib
 
 from langgraph.graph import StateGraph, START, END
 

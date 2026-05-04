@@ -19,7 +19,10 @@ from langchain_core.documents import Document
 
 from config import (
     PG_TABLE_NAME,
+    PG_TSV_CONFIG_EN,
+    PG_TSV_CONFIG_ZH,
     RETRIEVAL_K,
+    RERANKER_MODEL,
     RERANK_TOP_N,
     ENSEMBLE_WEIGHTS,
     RRF_K,
@@ -80,11 +83,66 @@ def rewrite_query(query: str, llm=None) -> list[str]:
 # ============================================================================
 
 
+def _detect_query_language(text: str) -> str:
+    """粗粒度识别查询语言，用于选择 FTS 通道。"""
+    if not text:
+        return "unknown"
+    zh = sum(1 for ch in text if "\u4e00" <= ch <= "\u9fff")
+    en = sum(1 for ch in text if ("a" <= ch.lower() <= "z"))
+    if zh > 0:
+        return "zh"
+    if en > 0:
+        return "en"
+    return "unknown"
+
+
+def _fts_channel_for_query(query: str) -> tuple[str, str]:
+    """按查询语言选择 FTS 列与配置。"""
+    language = _detect_query_language(query)
+    if language == "zh":
+        return "content_tsv_zh", PG_TSV_CONFIG_ZH
+    return "content_tsv_en", PG_TSV_CONFIG_EN
+
+
+def _build_metadata_filters(
+    acl_roles: list[str] | None,
+    domain: str | None,
+    language: str | None,
+    active_only: bool,
+) -> tuple[str, list]:
+    """构建 metadata JSONB 过滤 SQL 片段与参数。"""
+    clauses: list[str] = []
+    params: list = []
+
+    if active_only:
+        clauses.append("COALESCE(metadata->>'is_active', 'true') = 'true'")
+
+    if domain:
+        clauses.append("metadata->>'domain' = %s")
+        params.append(domain)
+
+    if language:
+        clauses.append("metadata->>'language' = %s")
+        params.append(language)
+
+    if acl_roles:
+        clauses.append("(metadata->'allowed_roles') ?| %s::text[]")
+        params.append(acl_roles)
+
+    if not clauses:
+        return "", []
+    return " AND " + " AND ".join(clauses), params
+
+
 def vector_search(
     queries: list[str],
     _vectorstore=None,
     k: int = RETRIEVAL_K,
     collection_name: str = "enterprise_rag",
+    acl_roles: list[str] | None = None,
+    domain: str | None = None,
+    language: str | None = None,
+    active_only: bool = True,
 ) -> list[Document]:
     """
     向量语义检索：对每个查询变体执行 similarity_search，合并结果
@@ -104,6 +162,13 @@ def vector_search(
     seen_hashes = set()
     results: list[Document] = []
 
+    where_tail, filter_params = _build_metadata_filters(
+        acl_roles=acl_roles,
+        domain=domain,
+        language=language,
+        active_only=active_only,
+    )
+
     with get_pg_connection() as conn:
         with conn.cursor() as cur:
             for q in queries:
@@ -113,10 +178,11 @@ def vector_search(
                     SELECT content, metadata
                     FROM {PG_TABLE_NAME}
                     WHERE collection_name = %s
+                      {where_tail}
                     ORDER BY embedding <=> %s::vector
                     LIMIT %s
                     """,
-                    (collection_name, str(q_vec), k),
+                    [collection_name, *filter_params, str(q_vec), k],
                 )
                 for content, metadata in cur.fetchall():
                     h = content_hash(content)
@@ -133,6 +199,10 @@ def bm25_search(
     documents: list[Document] | None = None,
     k: int = RETRIEVAL_K,
     collection_name: str = "enterprise_rag",
+    acl_roles: list[str] | None = None,
+    domain: str | None = None,
+    language: str | None = None,
+    active_only: bool = True,
 ) -> list[Document]:
     """
     BM25 关键词检索：基于词频的精确匹配检索
@@ -150,11 +220,28 @@ def bm25_search(
     """
     from utils import content_hash
 
+    def _allow_by_filters(doc: Document) -> bool:
+        meta = doc.metadata or {}
+        if active_only and str(meta.get("is_active", True)).lower() != "true":
+            return False
+        if domain and meta.get("domain") != domain:
+            return False
+        if language and meta.get("language") != language:
+            return False
+        if acl_roles:
+            roles = meta.get("allowed_roles", []) or []
+            if not any(role in roles for role in acl_roles):
+                return False
+        return True
+
     # 兼容旧接口：若调用方仍传入 documents，则沿用内存 BM25 逻辑。
     if documents is not None:
         from langchain_community.retrievers import BM25Retriever
 
-        bm25 = BM25Retriever.from_documents(documents, k=k)
+        filtered_docs = [doc for doc in documents if _allow_by_filters(doc)]
+        if not filtered_docs:
+            return []
+        bm25 = BM25Retriever.from_documents(filtered_docs, k=k)
         seen_hashes = set()
         results: list[Document] = []
         for q in queries:
@@ -171,22 +258,31 @@ def bm25_search(
     seen_hashes = set()
     results: list[Document] = []
 
+    where_tail, filter_params = _build_metadata_filters(
+        acl_roles=acl_roles,
+        domain=domain,
+        language=language,
+        active_only=active_only,
+    )
+
     with get_pg_connection() as conn:
         with conn.cursor() as cur:
             for q in queries:
+                tsv_column, ts_config = _fts_channel_for_query(q)
                 cur.execute(
                     f"""
                     SELECT content, metadata
                     FROM {PG_TABLE_NAME}
                     WHERE collection_name = %s
-                      AND content_tsv @@ websearch_to_tsquery('simple', %s)
+                      {where_tail}
+                      AND {tsv_column} @@ websearch_to_tsquery(%s, %s)
                     ORDER BY ts_rank_cd(
-                        content_tsv,
-                        websearch_to_tsquery('simple', %s)
+                        {tsv_column},
+                        websearch_to_tsquery(%s, %s)
                     ) DESC
                     LIMIT %s
                     """,
-                    (collection_name, q, q, k),
+                    [collection_name, *filter_params, ts_config, q, ts_config, q, k],
                 )
                 for content, metadata in cur.fetchall():
                     h = content_hash(content)
@@ -292,8 +388,8 @@ def rerank_documents(
     from langchain_community.cross_encoders import HuggingFaceCrossEncoder
     from langchain_classic.retrievers.document_compressors import CrossEncoderReranker
 
-    # 加载 CrossEncoder 模型（首次运行会自动下载约 80MB）
-    cross_encoder = HuggingFaceCrossEncoder(model_name="cross-encoder/ms-marco-MiniLM-L-6-v2")
+    # 加载 CrossEncoder 模型（首次运行会自动下载模型文件）
+    cross_encoder = HuggingFaceCrossEncoder(model_name=RERANKER_MODEL)
     reranker = CrossEncoderReranker(model=cross_encoder, top_n=top_n)
 
     # reranker.invoke() 返回排序后的 Document 列表
@@ -502,6 +598,10 @@ def build_retrieval_graph(
     vectorstore=None,
     all_documents: list[Document] | None = None,
     collection_name: str = "enterprise_rag",
+    acl_roles: list[str] | None = None,
+    domain: str | None = None,
+    language: str | None = None,
+    active_only: bool = True,
 ) -> StateGraph:
     """
     构建检索生成 LangGraph 工作流
@@ -527,6 +627,10 @@ def build_retrieval_graph(
             queries,
             vectorstore,
             collection_name=collection_name,
+            acl_roles=acl_roles,
+            domain=domain,
+            language=language,
+            active_only=active_only,
         )
         return {"vector_results": results}
 
@@ -536,6 +640,10 @@ def build_retrieval_graph(
             queries,
             documents=all_documents,
             collection_name=collection_name,
+            acl_roles=acl_roles,
+            domain=domain,
+            language=language,
+            active_only=active_only,
         )
         return {"bm25_results": results}
 

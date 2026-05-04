@@ -220,12 +220,26 @@ result = graph.invoke({
 |------|------|--------|------|
 | `parse_simple_pdf(file_path)` | `file_path: str` — PDF 路径 | `list[Document]` | PyPDFLoader 解析，每页一个 Document |
 | `parse_advanced_pdf(file_path)` | `file_path: str` — PDF 路径 | `list[Document]` | UnstructuredPDFLoader 解析，按元素类型拆分。未安装时 fallback 到 `parse_simple_pdf` |
+| `parse_document_by_type(file_path, domain, ...)` | 单文件路径 + 业务域 + ACL | `list[Document]` | 按扩展名自动分派（PDF/DOCX/CSV），并写入标准 metadata |
+| `parse_documents_in_dir(directory, domain, collection_name, ...)` | 目录路径 + 业务域 + 集合名 | `tuple[list[Document], dict]` | 批量解析目录，逐文件容错并输出统计信息 |
 | `chunk_documents(documents, chunk_size, chunk_overlap)` | `documents: list[Document]`；`chunk_size: int`（默认 500）；`chunk_overlap: int`（默认 50） | `list[Document]` | RecursiveCharacterTextSplitter 切片，支持中英文分隔符 |
+| `apply_quality_gate(chunks)` | `chunks: list[Document]` | `tuple[list[Document], int]` | 过滤空块/低质量块，减少噪声入库 |
 | `separate_by_element_type(documents)` | `documents: list[Document]` | `tuple[list[Document], list[Document]]` | 分离文本元素和表格元素，返回 `(text_docs, table_docs)` |
-| `embed_and_store(chunks, collection_name)` | `chunks: list[Document]`；`collection_name: str`（默认 `"enterprise_rag"`） | `Chroma` | 为每个 chunk 生成唯一 ID，向量化后存入 ChromaDB |
-| `reset_collection(collection_name)` | `collection_name: str`（默认 `"enterprise_rag"`） | `None` | 清空指定 ChromaDB 集合，避免重复数据 |
+| `embed_and_store(chunks, collection_name)` | `chunks: list[Document]`；`collection_name: str`（默认 `"enterprise_rag"`） | `int` | 为每个 chunk 生成唯一 ID，向量化后存入 PostgreSQL，并执行激活版本维护 |
+| `reset_collection(collection_name)` | `collection_name: str`（默认 `"enterprise_rag"`） | `None` | 清空指定 PostgreSQL 逻辑集合，避免重复数据 |
 | `build_ingestion_graph()` | 无 | `CompiledStateGraph` | 线性入库图：`START → parse → chunk → store → END` |
 | `build_multimodal_ingestion_graph()` | 无 | `CompiledStateGraph` | 多模态入库图：parse 后按元素类型分流，文本切片、表格保留原文，两路 reducer 合并后统一入库 |
+
+#### metadata 字段约定（企业检索必备）
+
+示例 3 入库时会写入以下关键 metadata 字段：
+
+- `domain`：业务域（例如 `resume_kb` / `crawl_kb` / `science_kb`）
+- `language`：粗粒度语言标记（`zh` / `en` / `unknown`）
+- `allowed_roles`：文档级 ACL 角色列表
+- `doc_id`：稳定业务文档 ID（不含版本号）
+- `version`：版本号（递增）
+- `is_active`：是否为当前生效版本（检索默认仅返回 `true`）
 
 #### embed_and_store 的 ID 生成策略
 
@@ -400,7 +414,7 @@ if sys.platform == "win32":
 |---|------|----------|-----------|
 | 1 | `example_1_basic_ingestion()` | PDF → 切片 → Embedding → ChromaDB → 验证检索 | `parse_simple_pdf`, `chunk_documents`, `embed_and_store`, `similarity_search` |
 | 2 | `example_2_graph_ingestion()` | 用 StateGraph 编排示例 1 的流程 | `build_ingestion_graph`, `graph.invoke()` |
-| 3 | `example_3_multimodal_processing()` | UnstructuredPDFLoader 解析 + 按元素类型分流 | `parse_advanced_pdf`, `separate_by_element_type`, `build_multimodal_ingestion_graph` |
+| 3 | `example_3_multimodal_processing()` | 目录级多格式入库（PDF+DOCX+CSV）+ 文本分层切分 + 表格整块 + ACL/版本 metadata | `parse_documents_in_dir`, `parse_document_by_type`, `separate_by_element_type`, `chunk_documents` |
 | 4 | `example_4_embedding_comparison()` | 对比两个 Embedding 模型的检索质量 | `get_embeddings`, `Chroma.from_documents`, `similarity_search_with_score` |
 | 5 | `example_5_hybrid_retrieval_reranking()` | 完整检索链：向量 + BM25 + 重排序 | `vector_search`, `bm25_search`, `merge_and_deduplicate`, `rerank_documents` |
 | 6 | `example_6_adaptive_generation()` | CRAG：评分 → 生成/fallback | `rewrite_query`, `grade_documents`, `generate_answer` |

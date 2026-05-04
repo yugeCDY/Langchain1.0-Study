@@ -21,6 +21,11 @@ load_dotenv()
 
 API_KEY = os.getenv("OPENAI_API_KEY")
 BASE_URL = os.getenv("OPENAI_API_BASE")
+LANGSMITH_TRACING = os.getenv("LANGSMITH_TRACING", "false").lower() == "true"
+LANGSMITH_API_KEY = os.getenv("LANGSMITH_API_KEY")
+LANGSMITH_PROJECT = os.getenv("LANGSMITH_PROJECT", "03_enterprise_rag")
+LANGSMITH_ENDPOINT = os.getenv("LANGSMITH_ENDPOINT")
+LANGSMITH_WORKSPACE_ID = os.getenv("LANGSMITH_WORKSPACE_ID")
 
 if not API_KEY:
     raise ValueError("请在 .env 中设置 OPENAI_API_KEY")
@@ -40,18 +45,18 @@ CHROMA_DIR = PROJECT_DIR / "chroma_store"
 # ============================================================================
 
 # LLM：通过 LiteLLM 代理调用
-LLM_MODEL_NAME = "openai:glm-5.1"
+LLM_MODEL_NAME = "deepseek:deepseek-v4-flash"
 
 # Embedding 模型
-EMBEDDING_MODEL_DEFAULT = "sentence-transformers/all-MiniLM-L6-v2"
-# ↑ 384 维，英文为主，轻量快速
-
-EMBEDDING_MODEL_MULTILINGUAL = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
+EMBEDDING_MODEL_DEFAULT = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
 # ↑ 384 维，支持 50+ 语言（含中文），适合中英混合文档
 
+EMBEDDING_MODEL_MULTILINGUAL = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
+# ↑ 显式保留多语言模型常量，便于示例代码对比或手动切换
+
 # Cross-Encoder 重排序模型
-RERANKER_MODEL = "cross-encoder/ms-marco-MiniLM-L-6-v2"
-# ↑ 轻量级重排序模型，本地运行，无需 API
+RERANKER_MODEL = "BAAI/bge-reranker-base"
+# ↑ 较轻量的中英双语重排序模型，适合本地资源受限场景
 
 # ============================================================================
 # 切片参数
@@ -65,7 +70,7 @@ CHUNK_OVERLAP = 50         # 相邻块重叠字符数（防止信息截断）
 # ============================================================================
 
 RETRIEVAL_K = 5            # 每路召回的文档数
-RERANK_TOP_N = 3           # 重排序后保留的文档数
+RERANK_TOP_N = 5           # 重排序后保留的文档数
 ENSEMBLE_WEIGHTS = [0.4, 0.6]  # [BM25 权重, Vector 权重]
 RRF_K = 60                 # RRF 融合平滑项（越大越平滑）
 RELEVANCE_THRESHOLD = 0.7  # 文档充分性评分阈值（低于此值触发 fallback）
@@ -80,6 +85,8 @@ POSTGRES_DSN = os.getenv(
 )
 PG_TABLE_NAME = os.getenv("PG_TABLE_NAME", "rag_documents")
 EMBEDDING_DIM = int(os.getenv("EMBEDDING_DIM", "384"))
+PG_TSV_CONFIG_ZH = os.getenv("PG_TSV_CONFIG_ZH", "chinese")
+PG_TSV_CONFIG_EN = os.getenv("PG_TSV_CONFIG_EN", "simple")
 
 # ============================================================================
 # 工厂函数
@@ -155,11 +162,19 @@ def init_postgres_schema():
                     collection_name TEXT NOT NULL,
                     content TEXT NOT NULL,
                     metadata JSONB NOT NULL DEFAULT '{{}}'::jsonb,
-                    content_tsv tsvector,
+                    content_tsv_zh tsvector,
+                    content_tsv_en tsvector,
                     embedding vector({EMBEDDING_DIM}),
                     created_at TIMESTAMPTZ NOT NULL DEFAULT now()
                 )
                 """
+            )
+            # 兼容已有表：按需补齐双语 FTS 列。
+            cur.execute(
+                f"ALTER TABLE {PG_TABLE_NAME} ADD COLUMN IF NOT EXISTS content_tsv_zh tsvector"
+            )
+            cur.execute(
+                f"ALTER TABLE {PG_TABLE_NAME} ADD COLUMN IF NOT EXISTS content_tsv_en tsvector"
             )
             cur.execute(
                 f"""
@@ -169,9 +184,16 @@ def init_postgres_schema():
             )
             cur.execute(
                 f"""
-                CREATE INDEX IF NOT EXISTS idx_{PG_TABLE_NAME}_content_tsv
+                CREATE INDEX IF NOT EXISTS idx_{PG_TABLE_NAME}_content_tsv_zh
                 ON {PG_TABLE_NAME}
-                USING GIN (content_tsv)
+                USING GIN (content_tsv_zh)
+                """
+            )
+            cur.execute(
+                f"""
+                CREATE INDEX IF NOT EXISTS idx_{PG_TABLE_NAME}_content_tsv_en
+                ON {PG_TABLE_NAME}
+                USING GIN (content_tsv_en)
                 """
             )
             # ivfflat 需要在数据量较大时配合 ANALYZE 才能发挥效果。
