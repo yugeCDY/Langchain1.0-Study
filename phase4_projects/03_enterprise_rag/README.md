@@ -43,7 +43,7 @@ pip install "unstructured[pdf]"
 
 ```bash
 python test.py    # 验证组件安装
-python main.py    # 运行完整示例
+uvicorn main:app --reload --port 8000    # 启动 FastAPI 服务
 ```
 
 ---
@@ -60,7 +60,9 @@ python main.py    # 运行完整示例
 ├── retrieval.py      # 检索引擎：改写、多路检索、重排序、评分、生成
 ├── graph_nodes.py    # LangGraph 节点：将业务函数封装为图节点
 ├── utils.py          # 工具函数：打印、哈希、样本 PDF 生成
-├── main.py           # 入口文件：7 个渐进式示例
+├── main.py           # FastAPI 入口文件
+├── schemas.py        # 请求/响应模型
+├── services.py       # API 服务层：入库与检索流水线编排
 ├── test.py           # 验证脚本：14 项组件检查
 ├── data/samples/     # 示例 PDF（程序自动生成）
 └── chroma_store/     # ChromaDB 持久化目录（自动创建）
@@ -103,7 +105,92 @@ chunk    extract_table   vector_search          bm25_search
                                         END
 ```
 
-两条图通过共享的 ChromaDB 向量库连接。入库图负责"把文档存进去"，检索图负责"从文档中找答案"。
+两条图通过共享的 PostgreSQL + pgvector 检索存储连接。入库图负责"把文档存进去"，检索图负责"从文档中找答案"。
+
+---
+
+## FastAPI 接口
+
+服务启动后可访问：
+
+- Swagger 文档：`http://127.0.0.1:8000/docs`
+- 健康检查：`GET /health`
+
+### 1. 多模态入库接口
+
+`POST /api/v1/ingestion/multimodal`
+
+用途：
+- 将 `example_3_multimodal_processing` 改造成接口
+- 支持一次上传多个 `pdf/docx/csv` 文件
+- `domain`、`allowed_roles`、`collection_name` 都作为请求参数传入
+
+请求方式：`multipart/form-data`
+
+表单字段：
+
+| 字段 | 类型 | 必填 | 说明 |
+|------|------|------|------|
+| `domain` | string | 是 | 业务域，同时可作为默认集合名 |
+| `allowed_roles` | string | 否 | ACL 角色列表，逗号分隔，例如 `hr,ops` |
+| `collection_name` | string | 否 | 指定入库集合名，不传时默认等于 `domain` |
+| `files` | file[] | 是 | 上传的文档文件，支持 PDF/DOCX/CSV |
+
+示例：
+
+```bash
+curl -X POST "http://127.0.0.1:8000/api/v1/ingestion/multimodal" \
+  -F "domain=resume_kb" \
+  -F "allowed_roles=hr,ops" \
+  -F "files=@data/samples/陈定煜-java.pdf" \
+  -F "files=@data/samples/测试导入0408.csv"
+```
+
+### 2. 完整检索流水线接口
+
+`POST /api/v1/retrieval/full-pipeline`
+
+用途：
+- 将 `example_7_full_pipeline` 改造成接口
+- 对外暴露完整的改写、混合检索、重排、评分、生成流程
+
+请求体：`application/json`
+
+| 字段 | 类型 | 必填 | 说明 |
+|------|------|------|------|
+| `query` | string | 是 | 用户查询 |
+| `roles` | string[] | 否 | ACL 角色列表，默认 `["hr"]` |
+| `collection_name` | string | 否 | 检索集合名，默认 `resume_kb` |
+| `domain` | string | 否 | 按业务域过滤 |
+| `language` | string | 否 | 按语言过滤 |
+| `active_only` | bool | 否 | 是否仅检索激活版本，默认 `true` |
+
+示例：
+
+```bash
+curl -X POST "http://127.0.0.1:8000/api/v1/retrieval/full-pipeline" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "query": "帮我查一下陈定煜的个人资料",
+    "roles": ["hr"],
+    "collection_name": "resume_kb"
+  }'
+```
+
+也支持便捷版：
+
+`GET /api/v1/retrieval/full-pipeline?query=...&roles=hr&roles=ops`
+
+### 3. 完整检索流水线流式接口
+
+`POST /api/v1/retrieval/full-pipeline/stream`
+
+用途：
+- 用于前端实时显示问答内容
+- 服务端返回 `text/event-stream`
+- 前端在收到第一个 token 后即可开始渲染答案
+
+请求体与 `POST /api/v1/retrieval/full-pipeline` 相同
 
 ---
 
@@ -406,21 +493,23 @@ if sys.platform == "win32":
 
 ---
 
-### 7. main.py — 入口文件（7 个示例）
+### 7. main.py — FastAPI 入口
 
-**作用**：7 个渐进式示例，从最基础的入库到端到端完整系统。每个示例用 `input("按 Enter 继续...")` 暂停。
+**作用**：对外暴露 Web API，并把原来的关键示例能力封装为接口。
 
-| # | 函数 | 核心流程 | 演示的组件 |
-|---|------|----------|-----------|
-| 1 | `example_1_basic_ingestion()` | PDF → 切片 → Embedding → ChromaDB → 验证检索 | `parse_simple_pdf`, `chunk_documents`, `embed_and_store`, `similarity_search` |
-| 2 | `example_2_graph_ingestion()` | 用 StateGraph 编排示例 1 的流程 | `build_ingestion_graph`, `graph.invoke()` |
-| 3 | `example_3_multimodal_processing()` | 目录级多格式入库（PDF+DOCX+CSV）+ 文本分层切分 + 表格整块 + ACL/版本 metadata | `parse_documents_in_dir`, `parse_document_by_type`, `separate_by_element_type`, `chunk_documents` |
-| 4 | `example_4_embedding_comparison()` | 对比两个 Embedding 模型的检索质量 | `get_embeddings`, `Chroma.from_documents`, `similarity_search_with_score` |
-| 5 | `example_5_hybrid_retrieval_reranking()` | 完整检索链：向量 + BM25 + 重排序 | `vector_search`, `bm25_search`, `merge_and_deduplicate`, `rerank_documents` |
-| 6 | `example_6_adaptive_generation()` | CRAG：评分 → 生成/fallback | `rewrite_query`, `grade_documents`, `generate_answer` |
-| 7 | `example_7_full_pipeline()` | 双图端到端系统 | `build_retrieval_graph`, 两个查询完整演示 |
+| 路由 | 对应能力 | 核心流程 |
+|------|----------|----------|
+| `GET /` | 服务入口说明 | 返回接口列表、LangSmith 状态 |
+| `GET /health` | 健康检查 | 用于服务探活 |
+| `POST /api/v1/ingestion/multimodal` | `example_3_multimodal_processing` | 上传文件 → 解析 → 切分 → 入库 |
+| `POST /api/v1/retrieval/full-pipeline` | `example_7_full_pipeline` | 查询改写 → 混合检索 → 重排 → 评分 → 生成 |
+| `GET /api/v1/retrieval/full-pipeline` | 同上便捷版 | 适合直接用浏览器或 query string 调试 |
 
-**依赖关系**：示例 1 和 2 都会入库数据。示例 5 依赖示例 2 的数据（`enterprise_rag` 集合）。示例 7 独立入库（`example7_full` 集合）。
+**启动方式**：
+
+```bash
+uvicorn main:app --reload --port 8000
+```
 
 ---
 

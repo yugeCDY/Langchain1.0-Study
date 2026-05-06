@@ -312,7 +312,7 @@ def main():
         print("如需完整功能：")
         print('  pip install "unstructured[pdf]" fpdf2')
     else:
-        print("\n所有组件验证通过！可以运行 python main.py 开始学习")
+        print("\n所有组件验证通过！可以运行 uvicorn main:app --reload --port 8000 启动服务")
 
     return failed == 0
 

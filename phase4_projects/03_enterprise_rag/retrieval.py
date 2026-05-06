@@ -15,6 +15,9 @@
 - build_retrieval_graph()  构建检索 LangGraph
 """
 
+from collections.abc import AsyncIterator
+from datetime import datetime
+
 from langchain_core.documents import Document
 
 from config import (
@@ -138,7 +141,7 @@ def vector_search(
     queries: list[str],
     _vectorstore=None,
     k: int = RETRIEVAL_K,
-    collection_name: str = "enterprise_rag",
+    collection_name: str | None = None,
     acl_roles: list[str] | None = None,
     domain: str | None = None,
     language: str | None = None,
@@ -173,16 +176,23 @@ def vector_search(
         with conn.cursor() as cur:
             for q in queries:
                 q_vec = emb.embed_query(q)
+                sql_clauses = ["1=1"]
+                params = []
+                if collection_name is not None:
+                    sql_clauses.append("collection_name = %s")
+                    params.append(collection_name)
+                if where_tail:
+                    sql_clauses.append(where_tail.removeprefix(" AND "))
+                params.extend(filter_params)
                 cur.execute(
                     f"""
                     SELECT content, metadata
                     FROM {PG_TABLE_NAME}
-                    WHERE collection_name = %s
-                      {where_tail}
+                    WHERE {' AND '.join(sql_clauses)}
                     ORDER BY embedding <=> %s::vector
                     LIMIT %s
                     """,
-                    [collection_name, *filter_params, str(q_vec), k],
+                    [*params, str(q_vec), k],
                 )
                 for content, metadata in cur.fetchall():
                     h = content_hash(content)
@@ -198,7 +208,7 @@ def bm25_search(
     queries: list[str],
     documents: list[Document] | None = None,
     k: int = RETRIEVAL_K,
-    collection_name: str = "enterprise_rag",
+    collection_name: str | None = None,
     acl_roles: list[str] | None = None,
     domain: str | None = None,
     language: str | None = None,
@@ -269,12 +279,19 @@ def bm25_search(
         with conn.cursor() as cur:
             for q in queries:
                 tsv_column, ts_config = _fts_channel_for_query(q)
+                sql_clauses = ["1=1"]
+                params = []
+                if collection_name is not None:
+                    sql_clauses.append("collection_name = %s")
+                    params.append(collection_name)
+                if where_tail:
+                    sql_clauses.append(where_tail.removeprefix(" AND "))
+                params.extend(filter_params)
                 cur.execute(
                     f"""
                     SELECT content, metadata
                     FROM {PG_TABLE_NAME}
-                    WHERE collection_name = %s
-                      {where_tail}
+                    WHERE {' AND '.join(sql_clauses)}
                       AND {tsv_column} @@ websearch_to_tsquery(%s, %s)
                     ORDER BY ts_rank_cd(
                         {tsv_column},
@@ -282,7 +299,7 @@ def bm25_search(
                     ) DESC
                     LIMIT %s
                     """,
-                    [collection_name, *filter_params, ts_config, q, ts_config, q, k],
+                    [*params, ts_config, q, ts_config, q, k],
                 )
                 for content, metadata in cur.fetchall():
                     h = content_hash(content)
@@ -469,30 +486,10 @@ def grade_documents(
 # ============================================================================
 
 
-def generate_answer(
+def _build_answer_prompt(
     query: str,
     documents: list[Document],
-    llm=None,
 ) -> tuple[str, list[dict]]:
-    """
-    基于检索到的文档生成回答
-
-    生成策略：
-    1. 将文档拼接为上下文
-    2. 构造 system prompt 要求基于上下文回答
-    3. LLM 生成带来源引用的回答
-
-    参数:
-        query: 用户查询
-        documents: 检索到的文档
-        llm: LLM 实例
-
-    返回:
-        (回答文本, 来源引用列表)
-    """
-    if llm is None:
-        llm = get_llm()
-
     from utils import format_sources
 
     context = "\n\n---\n\n".join(
@@ -512,10 +509,75 @@ def generate_answer(
 
 用户问题：{query}"""
 
-    response = llm.invoke(prompt)
     sources = format_sources(documents)
+    return prompt, sources
+
+
+def generate_answer(
+    query: str,
+    documents: list[Document],
+    llm=None,
+) -> tuple[str, list[dict]]:
+    """
+    基于检索到的文档生成回答
+
+    返回:
+        (回答文本, 来源引用列表)
+    """
+    if llm is None:
+        llm = get_llm()
+
+    prompt, sources = _build_answer_prompt(query, documents)
+    response = llm.invoke(prompt)
 
     return response.content, sources
+
+
+async def astream_generate_answer(
+    query: str,
+    documents: list[Document],
+    llm=None,
+) -> AsyncIterator[str]:
+    """
+    基于检索到的文档异步流式生成回答 token。
+    """
+    if llm is None:
+        llm = get_llm()
+
+    prompt, _ = _build_answer_prompt(query, documents)
+    print(
+        f"[astream_generate_answer] {datetime.now().isoformat(timespec='seconds')} start streaming",
+        flush=True,
+    )
+    async for chunk in llm.astream(prompt):
+        text = getattr(chunk, "content", None)
+
+        if isinstance(text, list):
+            pieces: list[str] = []
+            for item in text:
+                if isinstance(item, str):
+                    pieces.append(item)
+                elif isinstance(item, dict) and isinstance(item.get("text"), str):
+                    pieces.append(item["text"])
+            text = "".join(pieces)
+
+        if text is None and isinstance(chunk, str):
+            text = chunk
+
+        if text:
+            preview = text.replace("\n", "\\n")
+            if len(preview) > 80:
+                preview = preview[:77] + "..."
+            print(
+                f"[astream_generate_answer] {datetime.now().isoformat(timespec='milliseconds')} "
+                f"chunk_len={len(text)} chunk={preview!r}",
+                flush=True,
+            )
+            yield text
+    print(
+        f"[astream_generate_answer] {datetime.now().isoformat(timespec='seconds')} end streaming",
+        flush=True,
+    )
 
 
 # ============================================================================
@@ -597,7 +659,7 @@ def _route_by_score(state: RetrievalState) -> str:
 def build_retrieval_graph(
     vectorstore=None,
     all_documents: list[Document] | None = None,
-    collection_name: str = "enterprise_rag",
+    collection_name: str | None = None,
     acl_roles: list[str] | None = None,
     domain: str | None = None,
     language: str | None = None,
